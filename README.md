@@ -1,124 +1,135 @@
-# 地理数据处理工具集
+# 地理数据处理工具集 (Geospatial Data Processing Toolkit)
 
-一个综合性的地理空间数据处理工具集，用于卫星影像下载、道路矢量数据获取、瓦片拼接和道路语义分割mask生成。
+这是一个综合性的地理空间数据处理工具集，专为地理信息系统 (GIS) 和遥感数据处理设计。主要功能涵盖卫星影像下载、OSM道路矢量数据获取与清洗、瓦片拼接、以及深度学习标注数据（LabelMe JSON <-> Binary Mask）的高效转换。
 
-## 🚀 快速开始
+## 🛠️ 环境搭建指南
 
-### 安装依赖
+为了确保所有依赖库（特别是 GDAL 和 GeoPandas）能正确安装，强烈建议使用 **Anaconda** 或 **Miniconda** 进行环境管理。
+
+### 1. 创建虚拟环境
+
+打开 Anaconda Prompt 或终端，执行以下命令创建一个新的 Python 3.9 环境（推荐 3.9 版本以获得最佳兼容性）：
+
+```bash
+conda create -n dataprocess python=3.9
+conda activate dataprocess
+```
+
+### 2. 安装核心依赖
+
+由于 `labelme` 是本项目的关键组件，且 `geopandas` 在 Windows 下直接通过 pip 安装容易出错，建议按以下顺序安装：
+
+#### 第一步：安装 LabelMe
+```bash
+pip install labelme
+```
+
+#### 第二步：安装 GeoPandas 和其他科学计算库
+推荐使用 conda 安装 `geopandas` 和 `osmnx`，因为 conda 会自动处理底层的 C++ 依赖（如 GDAL, GEOS）：
+
+```bash
+conda install --channel conda-forge geopandas osmnx
+```
+
+#### 第三步：安装剩余依赖
+安装项目中列出的其他 Python 库：
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 启动GUI（推荐）
+*如果遇到依赖冲突，请确保您的 `pip` 是最新的：`python -m pip install --upgrade pip`*
+
+## 🚀 启动方式
+
+环境配置完成后，在项目根目录下运行以下命令启动图形用户界面 (GUI)：
+
 ```bash
-python main.py gui
+python main.py
 ```
 
-### 命令行使用
-```bash
-# 下载OSM道路数据
-python main.py osm --bbox 116.3,39.8,116.5,39.9 --output data/output/roads.geojson --roads-only
+## 📖 功能使用手册
 
-# 查看帮助
-python main.py --help
-```
+### 1. 数据预处理 (Data Preprocessing)
 
-## 📁 项目结构
+此标签页集成了从数据获取到预处理的完整流程。
+
+*   **1. 数据下载**:
+    *   **下载类型**: 选择数据源（如 Google Satellite, Bing Maps, OSM Vector 等）。
+    *   **BBox 设置**: 输入感兴趣区域的经纬度范围 (Left, Bottom, Right, Top)。
+    *   **输出目录**: 设置下载文件的保存位置。
+    *   点击 **"开始下载"** 即可启动多线程下载任务。
+
+*   **2. 数据清洗**:
+    *   主要用于处理 OSM 矢量数据。
+    *   **输入文件**: 选择下载的 OSM GeoJSON 文件。
+    *   **提取主干道**: 点击按钮可自动过滤出主要道路网络。
+    *   **保存结果**: 将清洗后的数据保存为新的 GeoJSON 文件。
+
+*   **3. 瓦片拼接**:
+    *   将下载的瓦片碎片拼接成完整的大图（GeoTIFF/PNG）。
+    *   **瓦片目录**: 指向包含瓦片图片的文件夹。
+    *   **矢量文件**: (可选) 用于裁剪或参考的矢量范围。
+    *   **缩放级别**: 设置拼接的目标 Zoom Level。
+
+### 2. 标注转换 (Annotation Conversion)
+
+此功能用于连接标注工具 (LabelMe) 和深度学习训练数据 (Mask) 之间的桥梁。
+
+*   **Mask 转 LabelMe JSON**:
+    *   适用于：已有二值 Mask 图像，需要导入 LabelMe 进行人工精修。
+    *   **输入**: Mask 目录（二值图）+ 影像目录（原图）。
+    *   **输出**: 生成对应的 JSON 文件，可在 LabelMe 中直接打开编辑。
+
+*   **LabelMe JSON 转 Mask**:
+    *   适用于：人工标注完成后，生成用于模型训练的二值 Mask。
+    *   **输入**: 包含 JSON 文件的目录。
+    *   **输出**: 生成对应的二值 Mask 图像。
+
+### 3. 自定义 LabelMe (Custom LabelMe)
+
+本项目集成了一个轻量级的 LabelMe 编辑器，无需单独启动外部程序即可快速查看和修改标注。
+
+*   **加载数据**: 点击 **"Load Directories"**，分别设置：
+    *   `Image Dir`: 原图目录
+    *   `JSON Dir`: 标注文件目录
+    *   `Save Dir`: 保存目录
+*   **常用操作**:
+    *   **Create Polygon**: 开始绘制新的多边形标注。
+    *   **Edit Mode**: 编辑现有的标注点。
+    *   **Save**: 保存修改。
+*   **快捷键**:
+    *   `Q`: 上一张图片
+    *   `D`: 删除选中的标注
+    *   `Ctrl+S`: 保存
+
+## 📁 项目结构说明
 
 ```
 dataprocess/
-├── core/                   # 核心功能模块
-│   ├── osm_fetcher.py     # OSM数据下载
-│   ├── osm_cleaner.py     # OSM数据清洗
-│   ├── tile_downloader.py # 通用瓦片下载器
-│   ├── bing_dom_downloader.py  # Bing DOM瓦片下载
-│   ├── tile_compositor.py # 瓦片拼接
-│   └── road_segmentation.py   # 道路缓冲区生成
-│
-├── gui/                    # 图形用户界面
-│   └── app.py             # PySide6主GUI应用
-│
-├── config/                 # 配置文件
-│   ├── parameters.py      # 参数配置
-│   ├── settings.py        # 全局设置
-│   └── download_types.py  # 下载类型定义
-│
-├── utils/                  # 工具函数
-│   ├── data_analyzer.py   # 数据分析
-│   └── url_detector.py    # URL格式检测
-│
-├── tests/                  # 单元测试
-│   └── test_osm_fetcher.py
-│
-├── scripts/                # 实用脚本工具
-│   ├── dual_tile_process.py           # 双源瓦片拼接
-│   ├── create_simple_vrt_and_vector.py
-│   ├── fix_vrt_paths.py
-│   ├── process_from_gpkg.py
-│   ├── run_modified_roadmask.py
-│   └── ...
-│
-├── docs/                   # 项目文档
-│   ├── 模式说明.md        # Roadmask模式详解
-│   ├── 处理结果总结.md    # 处理结果统计
-│   ├── 性能优化说明.md    # 8项优化技术
-│   ├── DUAL_TILE_COMPOSITOR_README.md
-│   └── ...
-│
-├── data/                   # 数据目录
-│   ├── input/             # 输入数据
-│   ├── output/            # 输出结果
-│   └── cache/             # 缓存文件
-│
-├── main.py                 # 命令行主入口
-├── roadmasktest.py        # 道路Mask生成（核心算法）
-└── requirements.txt       # 依赖包列表
+├── config/                 # 配置文件 (下载源URL、参数配置)
+├── core/                   # 核心算法模块
+│   ├── osm_fetcher.py      # OSM数据获取
+│   ├── tile_downloader.py  # 瓦片下载器
+│   ├── tile_compositor.py  # 瓦片拼接逻辑
+│   ├── labelme2mask.py     # JSON转Mask算法
+│   └── mask2labelme.py     # Mask转JSON算法
+├── gui/                    # GUI 界面代码
+│   ├── datapreprocessing_tab.py  # 预处理界面
+│   ├── mask_conversion_tab.py    # 转换界面
+│   └── custom_labelme_tab.py     # 内嵌LabelMe界面
+├── utils/                  # 通用工具
+├── main.py                 # 程序启动入口
+└── requirements.txt        # 依赖列表
 ```
 
-## 🎯 主要功能
+## ⚠️ 常见问题
 
-### 1. OSM数据下载
-- 支持矢量文件/BBOX范围
-- 多类型数据（道路、铁路、建筑等）
-- 自动坐标转换和缓存
+1.  **GeoPandas 导入错误**:
+    *   如果启动时提示找不到 DLL 或模块，通常是 GDAL 环境问题。请尝试卸载 `geopandas` 和 `fiona`，然后使用 `conda install -c conda-forge geopandas` 重新安装。
 
-### 2. 卫星影像下载
-- **数据源**: Google、Bing、OSM、Mapbox、Esri
-- **缩放级别**: 0-20
-- 并发下载，失败重试
+2.  **地图瓦片无法下载**:
+    *   请检查网络连接。部分地图服务（如 Google）可能需要代理才能访问。
 
-### 3. 瓦片拼接
-- 4x4瓦片拼接成1024x1024复合图
-- 生成GeoTIFF和VRT地理参考
-- 双源同步拼接（Google+Bing）
-
-### 4. 道路语义分割 ⭐
-**核心算法**: `roadmasktest.py`
-- 🔬 **8项优化**: LRU缓存、多指标融合、自适应阈值等
-- 📊 **两种模式**: 
-  - Visualization - 可视化分析
-  - Annotation - 深度学习训练数据
-- 🎯 **性能**: 速度提升2-3倍，准确率提升25-40%
-
-## 📖 文档
-
-详细文档位于 `docs/` 目录：
-- [模式说明](docs/模式说明.md) - Roadmask功能详解
-- [处理结果总结](docs/处理结果总结.md) - 处理结果统计
-- [性能优化说明](docs/性能优化说明.md) - 技术优化详解
-- [双源拼接说明](docs/DUAL_TILE_COMPOSITOR_README.md)
-
-## 🛠️ 技术栈
-
-- **地理数据**: geopandas, rasterio, shapely, osmnx
-- **图像处理**: opencv-python, scikit-image
-- **GUI**: PySide6
-- **瓦片处理**: mercantile
-
-## 📝 许可证
-
-项目路径: `d:\gjn\dataprocess\`
-
----
-
-**最后更新**: 2025-11-28
+3.  **LabelMe 模块未找到**:
+    *   确保已运行 `pip install labelme`。GUI 依赖于系统环境中安装的 `labelme` 库来加载画布组件。
