@@ -16,18 +16,25 @@ from shapely.geometry import box
 logger = logging.getLogger(__name__)
 
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
 def _make_session(user_agent: Optional[str] = None, proxies: Optional[dict] = None) -> requests.Session:
     """创建一个自定义的requests会话"""
     session = requests.Session()
-    ua = user_agent or (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0 Safari/537.36"
-    )
+    ua = user_agent or random.choice(USER_AGENTS)
     session.headers.update({
         "User-Agent": ua,
         "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
         "Connection": "keep-alive",
         "Referer": "https://www.google.com/",
+        "Accept-Language": "en-US,en;q=0.9",
     })
     if proxies:
         session.proxies.update(proxies)
@@ -62,7 +69,7 @@ def _tile_to_filename(tile: mercantile.Tile) -> str:
 def _download_one(
     tile: mercantile.Tile,
     output_dir: str,
-    url_template: str,
+    url_template: Union[str, List[str]],
     session: requests.Session,
     max_retries: int,
     backoff_factor: float,
@@ -74,51 +81,82 @@ def _download_one(
     if os.path.exists(filepath):
         return filename, True, "exists"
 
-    url = url_template.format(x=tile.x, y=tile.y, z=tile.z)
+    if isinstance(url_template, list):
+        # Randomly shuffle URLs for load balancing and retry sequence
+        urls = list(url_template)
+        random.shuffle(urls)
+    else:
+        urls = [url_template]
 
-    attempt = 0
-    while attempt <= max_retries:
-        try:
-            resp = session.get(url, stream=True, timeout=request_timeout)
-            if resp.status_code == 200:
-                with open(filepath, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                return filename, True, "ok"
-            elif resp.status_code in (403, 429):
-                wait = (backoff_factor ** attempt) + random.uniform(0, 1)
+    # Iterate through all available URLs
+    last_error = "unknown_error"
+    for url_fmt in urls:
+        url = url_fmt.format(x=tile.x, y=tile.y, z=tile.z)
+        
+        attempt = 0
+        while attempt <= max_retries:
+            try:
+                # Randomize UA occasionally on retries (every 2nd retry) to avoid fingerprinting
+                if attempt > 0 and attempt % 2 == 0:
+                    session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+
+                resp = session.get(url, stream=True, timeout=request_timeout)
+                if resp.status_code == 200:
+                    with open(filepath, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    return filename, True, "ok"
+                elif resp.status_code in (403, 429):
+                    wait = (backoff_factor ** attempt) + random.uniform(0.5, 2.0)
+                    logging.warning(
+                        f"Got {resp.status_code} for {url}. Backing off {wait:.1f}s (attempt {attempt}/{max_retries})"
+                    )
+                    time.sleep(wait)
+                    last_error = f"status_{resp.status_code}"
+                    
+                    # If 403 Forbidden, sometimes it's IP ban or URL specific.
+                    # If we have other URLs, maybe we should break early and try next URL?
+                    # But let's stick to retry logic for now, unless max retries reached.
+                elif 500 <= resp.status_code < 600:
+                    wait = (backoff_factor ** attempt) + random.uniform(0.5, 2.0)
+                    logging.warning(
+                        f"Server error {resp.status_code} for {url}. Backing off {wait:.1f}s"
+                    )
+                    time.sleep(wait)
+                    last_error = f"status_{resp.status_code}"
+                else:
+                    logging.error(f"Unexpected status {resp.status_code} for {url}")
+                    last_error = f"status_{resp.status_code}"
+                    # For 404 or other 4xx errors, might be better to try next URL immediately
+                    if resp.status_code == 404:
+                         break # Break retry loop to try next URL
+                    
+            except RequestException as e:
+                wait = (backoff_factor ** attempt) + random.uniform(0.5, 2.0)
                 logging.warning(
-                    f"Got {resp.status_code} for {url}. Backing off {wait:.1f}s (attempt {attempt}/{max_retries})"
+                    f"RequestException for {url}: {e}. Backing off {wait:.1f}s (attempt {attempt}/{max_retries})"
                 )
                 time.sleep(wait)
-            elif 500 <= resp.status_code < 600:
-                wait = (backoff_factor ** attempt) + random.uniform(0, 1)
-                logging.warning(
-                    f"Server error {resp.status_code} for {url}. Backing off {wait:.1f}s"
-                )
-                time.sleep(wait)
-            else:
-                logging.error(f"Unexpected status {resp.status_code} for {url}")
-                return filename, False, f"status_{resp.status_code}"
-        except RequestException as e:
-            wait = (backoff_factor ** attempt) + random.uniform(0, 1)
-            logging.warning(
-                f"RequestException for {url}: {e}. Backing off {wait:.1f}s (attempt {attempt}/{max_retries})"
-            )
-            time.sleep(wait)
-        except Exception as e:
-            logging.exception(f"未知异常: {e}")
-            return filename, False, f"error_{e}"
-        attempt += 1
+                last_error = f"error_{e}"
+            except Exception as e:
+                logging.exception(f"未知异常: {e}")
+                last_error = f"error_{e}"
+                break # Fatal error, try next URL or exit
 
-    return filename, False, "max_retries_exceeded"
+            attempt += 1
+        
+        # If we are here, it means we exhausted retries for THIS url or broke out.
+        # Continue to next URL in the list.
+        logging.info(f"Failed with {url}, trying next available URL...")
+
+    return filename, False, f"all_urls_failed: {last_error}"
 
 
 def _worker_download_with_rate(
     tile: mercantile.Tile,
     outdir: str,
-    url_template: str,
+    url_template: Union[str, List[str]],
     session: requests.Session,
     max_retries: int,
     backoff_factor: float,
@@ -178,7 +216,7 @@ class TileDownloader:
 
     def __init__(
         self,
-        url_template: str,
+        url_template: Union[str, List[str]],
         output_base_dir: str,
         checkpoint_path: str = "tile_checkpoint.json",
         user_agent: Optional[str] = None,

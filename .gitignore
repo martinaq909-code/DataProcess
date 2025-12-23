@@ -51,6 +51,18 @@ test_*.geojson
 *.tmp
 *.log
 
+# 运行日志
+logs/
+
+# 缓存与检查点
+cache/
+tile_checkpoint.json
+
+# 测试产物
+test_output.txt
+test_integration_output/
+test_stability_output/
+
 # 废弃功能
 deprecated_features/
 

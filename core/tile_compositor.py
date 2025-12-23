@@ -57,15 +57,22 @@ class TileCompositor:
         # 查找所有 .png 和 .jpeg 文件（支持两种格式：quadkey 或数字 quadkey）
         for tile_file in list(self.tiles_dir.glob("*.png")) + list(self.tiles_dir.glob("*.jpeg")) + list(self.tiles_dir.glob("*.jpg")):
             quadkey_or_numeric = tile_file.stem
+            # Strict validation: only accept digits 0-3
             if re.fullmatch(r"[0-3]+", quadkey_or_numeric):
                 self.tiles_dict[quadkey_or_numeric] = tile_file
+            else:
+                # If file naming is different (e.g. some tools save as x_y_z), we might need logic here
+                # But current downloader saves as quadkey.png, so we stick to it.
+                pass
         
         logger.info(f"Loaded {len(self.tiles_dict)} tiles from {self.tiles_dir}")
 
     def _quadkey_to_tile(self, quadkey: str) -> mercantile.Tile:
         """将 quadkey 转换为 tile 对象。"""
-        tile = mercantile.quadkey_to_tile(quadkey)
-        return tile
+        # Ensure input is a string of digits
+        if not re.fullmatch(r"[0-3]+", quadkey):
+             raise ValueError(f"Invalid quadkey format: {quadkey}")
+        return mercantile.quadkey_to_tile(quadkey)
     
     def _tile_to_numeric_quadkey(self, tile: mercantile.Tile) -> str:
         """将 tile 转换为数字 quadkey 格式（用于查找本地文件）。
@@ -185,24 +192,23 @@ class TileCompositor:
         return composite
 
     def _create_vrt(self, output_image_path: Path, vrt_path: Path, bounds: Tuple[float, float, float, float]) -> None:
-        """创建 VRT 文件。
+        """创建 VRT 文件 (使用 EPSG:3857 Web Mercator 投影)。
         
         Args:
             output_image_path: 输出图像路径
             vrt_path: 输出 VRT 文件路径
-            bounds: WGS84 边界 (west, south, east, north)
+            bounds: EPSG:3857 边界 (west, south, east, north) in Meters
         """
         west, south, east, north = bounds
         
         pixel_width = (east - west) / COMPOSITE_SIZE
-        pixel_height = (south - north) / COMPOSITE_SIZE  # 南北颠倒
+        pixel_height = (south - north) / COMPOSITE_SIZE  # 应该是负值 (south < north)
         
-        # 计算从 VRT 文件到 PNG 文件的相对路径
         # VRT 在 vrts/xxx.vrt，PNG 在 images/xxx.png，所以相对路径是 ../images/xxx.png
         relative_image_path = f"../images/{output_image_path.name}"
         
         vrt_content = f"""<VRTDataset rasterXSize="{COMPOSITE_SIZE}" rasterYSize="{COMPOSITE_SIZE}">
-  <SRS dataAxisToSRSAxisMapping="1,2">GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],AXIS["Latitude",NORTH],AXIS["Longitude",EAST]</SRS>
+  <SRS dataAxisToSRSAxisMapping="1,2">PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]],PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Easting",EAST],AXIS["Northing",NORTH],EXTENSION["PROJ4","+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs"],AUTHORITY["EPSG","3857"]]</SRS>
   <GeoTransform>{west}, {pixel_width}, 0, {north}, 0, {pixel_height}</GeoTransform>
   <VRTRasterBand dataType="Byte" band="1">
     <ColorInterp>Red</ColorInterp>
@@ -345,14 +351,24 @@ class TileCompositor:
                     south = end_bounds[1]    # 南: end 的南边（y大对应低纬度）
                     filename = self._coords_to_filename(west, south, east, north)
                     
+                    # 计算 EPSG:3857 (Web Mercator) 边界用于 VRT
+                    # VRT 必须使用 EPSG:3857，因为原始瓦片像素就是 Mercator 投影
+                    # 混合使用 WGS84 坐标和 Mercator 像素会导致图像变形
+                    start_bounds_m = mercantile.xy_bounds(start_tile_obj)
+                    end_bounds_m = mercantile.xy_bounds(end_tile)
+                    west_m = start_bounds_m.left
+                    east_m = end_bounds_m.right
+                    north_m = start_bounds_m.top
+                    south_m = end_bounds_m.bottom
+                    
                     # 保存图像到 images 目录
                     image_path = images_dir / f"{filename}.png"
                     cv2.imwrite(str(image_path), composite_img)
                     logger.info(f"       ├─ 已保存图像: {filename}.png ({composite_img.shape})")
                     
-                    # 保存 VRT 到 vrts 目录
+                    # 保存 VRT 到 vrts 目录 (使用 Meters 坐标)
                     vrt_path = vrts_dir / f"{filename}.vrt"
-                    self._create_vrt(image_path, vrt_path, (west, south, east, north))
+                    self._create_vrt(image_path, vrt_path, (west_m, south_m, east_m, north_m))
                     logger.info(f"       └─ 已保存 VRT: {filename}.vrt")
                     
                     results.append((image_path, vrt_path))

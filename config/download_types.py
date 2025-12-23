@@ -43,9 +43,14 @@ DOWNLOAD_TYPES = {
         description="Google 卫星影像 (高质量)",
         dtype="tiles",
         url_options=[
+            "https://khms0.google.com/kh/v=994?x={x}&y={y}&z={z}",
             "https://khms1.google.com/kh/v=994?x={x}&y={y}&z={z}",
+            "https://khms2.google.com/kh/v=994?x={x}&y={y}&z={z}",
+            "https://khms3.google.com/kh/v=994?x={x}&y={y}&z={z}",
+            "https://khms0.google.com/kh/v=995?x={x}&y={y}&z={z}",
             "https://khms1.google.com/kh/v=995?x={x}&y={y}&z={z}",
-            "https://khms1.google.com/kh/v=1000?x={x}&y={y}&z={z}",
+            "https://khms2.google.com/kh/v=995?x={x}&y={y}&z={z}",
+            "https://khms3.google.com/kh/v=995?x={x}&y={y}&z={z}",
         ],
         default_zoom=18,
         max_workers=8,  # 增加并发线程
@@ -78,6 +83,8 @@ DOWNLOAD_TYPES = {
         dtype="tiles",
         url_options=[
             "https://basemap.nationalmap.gov/arcgis/rest/services/USGSSatelliteImagery/MapServer/tile/{z}/{y}/{x}",
+            "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+            "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}",
         ],
         default_zoom=18,
         max_workers=8,  # 增加并发线程

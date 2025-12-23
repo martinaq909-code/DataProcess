@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -436,12 +437,21 @@ class DownloadWorker(QThread):
                 else:
                     self.finished.emit(f"OSM下载完成，共{len(res)}条要素")
             else:
-                url = detect_working_urls(dt.url_options) or dt.url_options[0]
+                valid_urls = detect_working_urls(dt.url_options)
+                if not valid_urls:
+                    valid_urls = dt.url_options
+                
+                # Use list if multiple URLs are available for load balancing
+                url_template = valid_urls if len(valid_urls) > 1 else valid_urls[0]
+
                 tiles_dir = os.path.join(self.out_dir, f"{self.dtype_key}_tiles_z{self.zoom}")
                 os.makedirs(tiles_dir, exist_ok=True)
-                self.log.emit(f"[Tiles] zoom={self.zoom} url={url}")
+                
+                log_msg = f"Multiple URLs ({len(url_template)})" if isinstance(url_template, list) else url_template
+                self.log.emit(f"[Tiles] zoom={self.zoom} url={log_msg}")
+                
                 downloader = TileDownloader(
-                    url_template=url,
+                    url_template=url_template,
                     output_base_dir=tiles_dir,
                     max_workers=dt.max_workers,
                     per_thread_min_sleep=dt.per_thread_min_sleep,
@@ -453,6 +463,5 @@ class DownloadWorker(QThread):
                 downloader.download_tiles_from_bbox(self.bbox, self.zoom)
                 self.finished.emit(f"瓦片下载完成，目录: {tiles_dir}")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            logger.exception("Download worker failed")
             self.failed.emit(str(e))

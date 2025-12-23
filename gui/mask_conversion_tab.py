@@ -47,9 +47,8 @@ class ConversionWorker(QThread):
                 self.finished.emit(f"LabelMe to Mask conversion completed.\nSaved to: {self.kwargs['output_dir']}")
                 
         except Exception as e:
-            import traceback
-            error_msg = f"Error during {self.task_type}:\n{str(e)}\n\n{traceback.format_exc()}"
-            self.error.emit(error_msg)
+            logger.exception("Conversion task failed")
+            self.error.emit(str(e))
 
 
 class MaskConversionTab(QWidget):

@@ -7,16 +7,16 @@ from typing import Optional, List
 logger = logging.getLogger(__name__)
 
 
-def detect_working_urls(url_options: List[str], timeout: int = 5) -> Optional[str]:
+def detect_working_urls(url_options: List[str], timeout: int = 5) -> List[str]:
     """
-    Detect which URL from options is accessible.
+    Detect which URLs from options are accessible.
     
     Args:
         url_options: List of URL templates to test
         timeout: Timeout for each request
         
     Returns:
-        First working URL template or None
+        List of working URL templates
     """
     # 测试坐标
     test_x, test_y, test_z = 215945, 101416, 18
@@ -25,6 +25,8 @@ def detect_working_urls(url_options: List[str], timeout: int = 5) -> Optional[st
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": "https://www.google.com/"
     }
+    
+    working_urls = []
     
     for url_template in url_options:
         try:
@@ -47,14 +49,16 @@ def detect_working_urls(url_options: List[str], timeout: int = 5) -> Optional[st
                 # 判断是否是有效的图片（大小 > 100 字节）
                 if ("image" in content_type or content_size > 100) and content_size < 1000000:  # < 1MB
                     logger.info(f"✓ Working URL found: {url_template[:50]}... (size: {content_size/1024:.1f}KB)")
-                    return url_template
+                    working_urls.append(url_template)
                     
         except Exception as e:
             logger.debug(f"URL test failed: {str(e)[:50]}")
             continue
     
-    logger.warning("No working URLs found in the provided options")
-    return None
+    if not working_urls:
+        logger.warning("No working URLs found in the provided options")
+    
+    return working_urls
 
 
 

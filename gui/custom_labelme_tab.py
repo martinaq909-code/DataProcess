@@ -4,6 +4,7 @@ import os
 import sys
 import glob
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,8 @@ from PyQt5.QtWidgets import (
     QScrollArea, QLabel, QMenu, QDialog, QLineEdit, QFormLayout, QDialogButtonBox,
     QTabWidget, QAction
 )
+
+logger = logging.getLogger(__name__)
 
 # Try to import labelme components from the environment
 # We defer import to avoid early QWidget instantiation or Qt conflicts
@@ -102,8 +105,7 @@ class CustomLabelMeTab(QWidget):
                 Canvas = LCanvas
                 Shape = LShape
             except ImportError as e:
-                print(f"Error: 'labelme' module not found or failed to import.\nDetails: {e}")
-                # print("Error: 'labelme' module not found. Please ensure 'labelme' is installed in your environment.")
+                logger.error(f"Error: 'labelme' module not found or failed to import. Details: {e}")
         
         if Canvas is None:
             self._build_error_ui()
@@ -408,6 +410,7 @@ class CustomLabelMeTab(QWidget):
             with open(json_path, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
+            logger.exception("Failed to save JSON")
             QMessageBox.critical(self, "Error", f"Failed to save: {e}")
 
     def load_next_image(self):
