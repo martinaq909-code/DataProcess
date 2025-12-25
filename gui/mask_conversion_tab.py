@@ -23,6 +23,7 @@ class ConversionWorker(QThread):
     """Worker thread for running conversions to avoid freezing UI."""
     finished = Signal(str)
     error = Signal(str)
+    log = Signal(str)
     
     def __init__(self, task_type, **kwargs):
         super().__init__()
@@ -31,18 +32,24 @@ class ConversionWorker(QThread):
         
     def run(self):
         try:
+            # Define callback to emit log signal
+            def callback(msg):
+                self.log.emit(msg)
+
             if self.task_type == "mask2labelme":
                 mask_to_labelme(
                     self.kwargs['mask_dir'],
                     self.kwargs['output_dir'],
-                    self.kwargs['img_dir']
+                    self.kwargs['img_dir'],
+                    callback=callback
                 )
                 self.finished.emit(f"Mask to LabelMe conversion completed.\nSaved to: {self.kwargs['output_dir']}")
                 
             elif self.task_type == "labelme2mask":
                 json_to_mask(
                     self.kwargs['json_dir'],
-                    self.kwargs['output_dir']
+                    self.kwargs['output_dir'],
+                    callback=callback
                 )
                 self.finished.emit(f"LabelMe to Mask conversion completed.\nSaved to: {self.kwargs['output_dir']}")
                 
@@ -151,6 +158,7 @@ class MaskConversionTab(QWidget):
         self.worker = ConversionWorker("mask2labelme", mask_dir=mask_dir, img_dir=img_dir, output_dir=out_dir)
         self.worker.finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
+        self.worker.log.connect(self._log)
         
         self._log("正在执行 Mask -> LabelMe 转换...")
         self.worker.start()
@@ -166,6 +174,7 @@ class MaskConversionTab(QWidget):
         self.worker = ConversionWorker("labelme2mask", json_dir=json_dir, output_dir=out_dir)
         self.worker.finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
+        self.worker.log.connect(self._log)
         
         self._log("正在执行 LabelMe -> Mask 转换...")
         self.worker.start()

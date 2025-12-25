@@ -107,7 +107,7 @@ QTextEdit {
     border-radius: 4px;
     background-color: white;
     font-family: Courier New;
-    font-size: 10px;
+    font-size: 14px;
 }
 
 QTabWidget::pane {
@@ -139,7 +139,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("道路数据处理工具")
-        self.setGeometry(100, 100, 1000, 750)
+        self.setGeometry(100, 100, 1000, 850)
         self.setStyleSheet(STYLESHEET)
         
         # Defer imports of tabs to here
@@ -167,6 +167,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         """Handle window close event - stop all worker threads."""
+        if hasattr(self, 'preprocess_tab') and self.preprocess_tab.download_worker:
+            if self.preprocess_tab.download_worker.isRunning():
+                self.preprocess_tab.download_worker.stop()
+        
         event.accept()
 
 

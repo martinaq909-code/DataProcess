@@ -157,9 +157,12 @@ class OSMCleaner:
         )
         return filtered
 
-    def extract_trunk_roads(self) -> gpd.GeoDataFrame:
+    def extract_trunk_roads(self, callback=None) -> gpd.GeoDataFrame:
         """Extract trunk roads (main roads) by removing non-trunk types, underground roads, and negative layer roads.
         
+        Args:
+            callback: Optional callback function(msg) for progress reporting.
+            
         Returns:
             GeoDataFrame with trunk roads only
         """
@@ -169,24 +172,45 @@ class OSMCleaner:
         if "highway" not in self.gdf.columns:
             raise ValueError("'highway' column not found")
         
-        logger.info(f"✓ 开始提取主干道")
-        logger.info(f"  原始要素数: {len(self.gdf)}")
+        msg = f"✓ 开始提取主干道"
+        logger.info(msg)
+        if callback:
+            callback(msg)
+            
+        msg = f"  原始要素数: {len(self.gdf)}"
+        logger.info(msg)
+        if callback:
+            callback(msg)
         
         # Remove non-trunk types
         before_type_filter = len(self.gdf)
         trunk_roads = self.gdf[~self.gdf["highway"].isin(self.NON_TRUNK_TYPES)].copy()
         removed_by_type = before_type_filter - len(trunk_roads)
-        logger.info(f"  移除非主干道类型后: {len(trunk_roads)} (移除 {removed_by_type} 个)")
+        
+        msg = f"  移除非主干道类型后: {len(trunk_roads)} (移除 {removed_by_type} 个)"
+        logger.info(msg)
+        if callback:
+            callback(msg)
         
         # Remove underground roads
         trunk_roads = self.remove_underground_roads(trunk_roads)
-        logger.info(f"  移除地下道路后: {len(trunk_roads)}")
+        msg = f"  移除地下道路后: {len(trunk_roads)}"
+        logger.info(msg)
+        if callback:
+            callback(msg)
         
         # Remove roads with negative layer values (e.g., layer=-1)
         trunk_roads = self.remove_negative_layer_roads(trunk_roads)
-        logger.info(f"  移除负层数值道路后: {len(trunk_roads)}")
+        msg = f"  移除负层数值道路后: {len(trunk_roads)}"
+        logger.info(msg)
+        if callback:
+            callback(msg)
         
-        logger.info(f"✓ 主干道提取完成: 保留 {len(trunk_roads)} 个要素")
+        msg = f"✓ 主干道提取完成: 保留 {len(trunk_roads)} 个要素"
+        logger.info(msg)
+        if callback:
+            callback(msg)
+            
         self.trunk_roads = trunk_roads
         return trunk_roads
 

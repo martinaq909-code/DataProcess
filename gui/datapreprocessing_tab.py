@@ -4,13 +4,14 @@ from __future__ import annotations
 import os
 import sys
 import logging
+import mercantile
 from pathlib import Path
 from typing import Optional
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QGroupBox, QFileDialog,
     QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QMessageBox,
     QRadioButton, QStackedWidget, QScrollArea
@@ -24,6 +25,7 @@ from core.tile_downloader import TileDownloader
 from core.osm_fetcher import fetch_osm_features
 from core.osm_cleaner import OSMCleaner
 from core.tile_compositor import TileCompositor
+from core.tile_filter import TileFilter
 
 
 class DataPreprocessingTab(QWidget):
@@ -56,17 +58,31 @@ class DataPreprocessingTab(QWidget):
         title.setFont(title_font)
         main_layout.addWidget(title)
 
+        # Create Grid Layout for 4 features
+        grid_layout = QGridLayout()
+        grid_layout.setSpacing(10)
+        # Ensure equal column width
+        grid_layout.setColumnStretch(0, 1)
+        grid_layout.setColumnStretch(1, 1)
+
         # ============ GroupBox 1: 数据下载 ============
         download_group = self._build_download_group()
-        main_layout.addWidget(download_group)
+        grid_layout.addWidget(download_group, 0, 0)
 
         # ============ GroupBox 2: 数据清洗 ============
         clean_group = self._build_clean_group()
-        main_layout.addWidget(clean_group)
+        grid_layout.addWidget(clean_group, 0, 1)
 
         # ============ GroupBox 3: 瓦片拼接 ============
         stitch_group = self._build_stitch_group()
-        main_layout.addWidget(stitch_group)
+        grid_layout.addWidget(stitch_group, 1, 0)
+
+        # ============ GroupBox 4: 瓦片清洗 ============
+        filter_group = self._build_filter_group()
+        grid_layout.addWidget(filter_group, 1, 1)
+
+        # Add grid to main layout
+        main_layout.addLayout(grid_layout)
 
         # ============ Shared Log ============
         log_label = QLabel("操作日志:")
@@ -77,7 +93,7 @@ class DataPreprocessingTab(QWidget):
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
+        self.log_text.setMinimumHeight(250)
         main_layout.addWidget(self.log_text)
 
         main_layout.addStretch()
@@ -101,9 +117,26 @@ class DataPreprocessingTab(QWidget):
         type_layout.addRow("下载类型:", self.download_type_combo)
         layout.addLayout(type_layout)
 
+        # Vector BBox loader
+        vec_bbox_layout = QHBoxLayout()
+        self.bbox_vector_file = QLineEdit()
+        self.bbox_vector_file.setPlaceholderText("选择矢量文件以读取范围...")
+        vec_bbox_btn = QPushButton("浏览")
+        vec_bbox_btn.setMaximumWidth(60)
+        vec_bbox_btn.clicked.connect(self._select_bbox_vector)
+        
+        load_bbox_btn = QPushButton("读取")
+        load_bbox_btn.setMaximumWidth(60)
+        load_bbox_btn.clicked.connect(self._load_bbox_from_vector)
+        
+        vec_bbox_layout.addWidget(QLabel("从矢量:"))
+        vec_bbox_layout.addWidget(self.bbox_vector_file)
+        vec_bbox_layout.addWidget(vec_bbox_btn)
+        vec_bbox_layout.addWidget(load_bbox_btn)
+        layout.addLayout(vec_bbox_layout)
+
         # Range input (simplified - bbox only)
         range_layout = QFormLayout()
-        bbox_layout = QHBoxLayout()
         
         self.bbox_left = QDoubleSpinBox()
         self.bbox_left.setRange(-180, 180)
@@ -117,15 +150,22 @@ class DataPreprocessingTab(QWidget):
         self.bbox_top = QDoubleSpinBox()
         self.bbox_top.setRange(-90, 90)
         self.bbox_top.setDecimals(6)
+
+        # Use Grid Layout for BBox to save horizontal space
+        bbox_layout = QGridLayout()
+        bbox_layout.setSpacing(5)
         
-        bbox_layout.addWidget(QLabel("Left:"))
-        bbox_layout.addWidget(self.bbox_left)
-        bbox_layout.addWidget(QLabel("Bottom:"))
-        bbox_layout.addWidget(self.bbox_bottom)
-        bbox_layout.addWidget(QLabel("Right:"))
-        bbox_layout.addWidget(self.bbox_right)
-        bbox_layout.addWidget(QLabel("Top:"))
-        bbox_layout.addWidget(self.bbox_top)
+        # Row 0: Left, Right (MinX, MaxX)
+        bbox_layout.addWidget(QLabel("Left:"), 0, 0)
+        bbox_layout.addWidget(self.bbox_left, 0, 1)
+        bbox_layout.addWidget(QLabel("Right:"), 0, 2)
+        bbox_layout.addWidget(self.bbox_right, 0, 3)
+        
+        # Row 1: Bottom, Top (MinY, MaxY)
+        bbox_layout.addWidget(QLabel("Bottom:"), 1, 0)
+        bbox_layout.addWidget(self.bbox_bottom, 1, 1)
+        bbox_layout.addWidget(QLabel("Top:"), 1, 2)
+        bbox_layout.addWidget(self.bbox_top, 1, 3)
         
         range_layout.addRow("BBox:", bbox_layout)
         layout.addLayout(range_layout)
@@ -214,17 +254,6 @@ class DataPreprocessingTab(QWidget):
         tiles_layout.addWidget(tiles_btn)
         form_layout.addRow("瓦片目录:", tiles_layout)
 
-        # Vector file
-        vec_layout = QHBoxLayout()
-        self.stitch_vector = QLineEdit()
-        self.stitch_vector.setPlaceholderText("选择矢量文件")
-        vec_btn = QPushButton("浏览")
-        vec_btn.setMaximumWidth(70)
-        vec_btn.clicked.connect(self._select_stitch_vector)
-        vec_layout.addWidget(self.stitch_vector)
-        vec_layout.addWidget(vec_btn)
-        form_layout.addRow("矢量文件:", vec_layout)
-
         # Output directory
         out_layout = QHBoxLayout()
         self.stitch_output = QLineEdit("data/output/composited")
@@ -244,12 +273,102 @@ class DataPreprocessingTab(QWidget):
         layout.addLayout(form_layout)
 
         # Stitch button
-        stitch_btn = QPushButton("拼接瓦片并切割矢量")
+        stitch_btn = QPushButton("仅拼接瓦片 (无VRT)")
         stitch_btn.setMinimumHeight(32)
         stitch_btn.clicked.connect(self._start_stitching)
         layout.addWidget(stitch_btn)
 
         return group
+
+    def _build_filter_group(self) -> QGroupBox:
+        """Build tile filtering GroupBox."""
+        group = QGroupBox("4. 瓦片清洗")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+
+        form_layout = QFormLayout()
+
+        # Input directory
+        in_layout = QHBoxLayout()
+        self.filter_input = QLineEdit("data/output/composited/images")
+        in_btn = QPushButton("浏览")
+        in_btn.setMaximumWidth(70)
+        in_btn.clicked.connect(lambda: self._select_dir(self.filter_input))
+        in_layout.addWidget(self.filter_input)
+        in_layout.addWidget(in_btn)
+        form_layout.addRow("输入目录:", in_layout)
+
+        # Output directory
+        out_layout = QHBoxLayout()
+        self.filter_output = QLineEdit("data/output/filtered_images")
+        out_btn = QPushButton("浏览")
+        out_btn.setMaximumWidth(70)
+        out_btn.clicked.connect(lambda: self._select_dir(self.filter_output))
+        out_layout.addWidget(self.filter_output)
+        out_layout.addWidget(out_btn)
+        form_layout.addRow("输出目录:", out_layout)
+
+        # Threshold (Black pixel ratio)
+        self.filter_threshold = QDoubleSpinBox()
+        self.filter_threshold.setRange(0.0, 1.0)
+        self.filter_threshold.setSingleStep(0.01)
+        self.filter_threshold.setValue(0.0625) # 1/16
+        self.filter_threshold.setDecimals(4)
+        form_layout.addRow("黑边阈值 (默认1/16):", self.filter_threshold)
+
+        layout.addLayout(form_layout)
+
+        # Filter button
+        filter_btn = QPushButton("执行清洗 (复制有效瓦片)")
+        filter_btn.setMinimumHeight(32)
+        filter_btn.clicked.connect(self._start_filtering)
+        layout.addWidget(filter_btn)
+
+        return group
+
+    def _select_bbox_vector(self) -> None:
+        """Select vector file for BBox."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择矢量文件", "",
+            "Vector Files (*.geojson *.shp *.gpkg *.kml);;All Files (*)"
+        )
+        if path:
+            self.bbox_vector_file.setText(path)
+            self._load_bbox_from_vector()
+
+    def _load_bbox_from_vector(self) -> None:
+        """Load bbox from vector file."""
+        path = self.bbox_vector_file.text().strip()
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "错误", "请先选择有效的矢量文件")
+            return
+
+        try:
+            import geopandas as gpd
+            # Show wait cursor
+            from PyQt5.QtWidgets import QApplication
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            
+            gdf = gpd.read_file(path)
+            # Ensure WGS84
+            if gdf.crs and gdf.crs.to_string() != "EPSG:4326":
+                gdf = gdf.to_crs("EPSG:4326")
+            
+            bounds = gdf.total_bounds # [minx, miny, maxx, maxy]
+            
+            self.bbox_left.setValue(bounds[0])
+            self.bbox_bottom.setValue(bounds[1])
+            self.bbox_right.setValue(bounds[2])
+            self.bbox_top.setValue(bounds[3])
+            
+            self._log(f"[BBox] 已加载范围: {bounds}")
+            QMessageBox.information(self, "成功", f"已从文件读取范围:\n{path}\n\nBBox: {bounds}")
+            
+        except Exception as e:
+            self._log(f"[BBox] 加载失败: {e}")
+            QMessageBox.critical(self, "错误", f"读取矢量文件失败:\n{e}")
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _select_dir(self, line_edit: QLineEdit) -> None:
         """Select directory."""
@@ -313,6 +432,39 @@ class DataPreprocessingTab(QWidget):
             return
 
         zoom = dt.default_zoom
+        
+        # Calculate tile count and estimate time
+        if dt.dtype != "vector":
+            tiles = list(mercantile.tiles(bbox[0], bbox[1], bbox[2], bbox[3], [zoom]))
+            total_tiles = len(tiles)
+            
+            # Estimation logic: 
+            # Assume ~0.5s per tile with 4 threads (conservative estimate including retries/sleep)
+            # 4 threads -> effective rate ~8 tiles/sec? 
+            # Let's be conservative: 4 workers, each takes 1s per tile (network+sleep) -> 4 tiles/sec
+            tiles_per_sec = 4
+            est_seconds = total_tiles / tiles_per_sec
+            
+            if est_seconds < 60:
+                est_time_str = f"{est_seconds:.1f} 秒"
+            elif est_seconds < 3600:
+                est_time_str = f"{est_seconds/60:.1f} 分钟"
+            else:
+                est_time_str = f"{est_seconds/3600:.1f} 小时"
+                
+            msg = (
+                f"准备下载:\n"
+                f"类型: {dt.name}\n"
+                f"Zoom: {zoom}\n"
+                f"瓦片数量: {total_tiles}\n"
+                f"预计耗时: {est_time_str}\n\n"
+                f"是否继续?"
+            )
+            
+            reply = QMessageBox.question(self, "下载确认", msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply == QMessageBox.No:
+                return
+
         self._log(f"[下载] 类型={dt.name}, zoom={zoom}")
         self._log(f"[下载] BBox={bbox}")
         self._log(f"[下载] 输出目录={out_dir}")
@@ -342,10 +494,23 @@ class DataPreprocessingTab(QWidget):
 
         try:
             self._log(f"[清洗] 加载文件: {file_path}")
-            self.cleaner = OSMCleaner(file_path)
-            self.cleaner.extract_trunk_roads()
-            self._log(f"[清洗] ✓ 提取完成，共{len(self.cleaner.trunk_roads)}条主干道")
-            QMessageBox.information(self, "完成", f"提取了{len(self.cleaner.trunk_roads)}条主干道")
+            # Use worker for cleaning
+            self.clean_worker = CleanWorker(file_path)
+            self.clean_worker.log.connect(self._log)
+            
+            def on_ok(trunk_roads):
+                self.cleaner = self.clean_worker.cleaner # Keep reference to cleaner
+                self._log(f"[清洗] ✓ 提取完成，共{len(trunk_roads)}条主干道")
+                QMessageBox.information(self, "完成", f"提取了{len(trunk_roads)}条主干道")
+                
+            def on_fail(msg):
+                self._log(f"[清洗] ✗ 错误: {msg}")
+                QMessageBox.critical(self, "错误", msg)
+                
+            self.clean_worker.finished.connect(on_ok)
+            self.clean_worker.failed.connect(on_fail)
+            self.clean_worker.start()
+            
         except Exception as e:
             self._log(f"[清洗] ✗ 错误: {e}")
             QMessageBox.critical(self, "错误", str(e))
@@ -372,15 +537,10 @@ class DataPreprocessingTab(QWidget):
     def _start_stitching(self) -> None:
         """Start tile stitching."""
         tiles_dir = self.stitch_tiles_dir.text().strip()
-        vector_file = self.stitch_vector.text().strip()
         output_dir = self.stitch_output.text().strip()
 
         if not tiles_dir or not os.path.exists(tiles_dir):
             QMessageBox.warning(self, "错误", "请选择有效的瓦片目录")
-            return
-
-        if not vector_file or not os.path.exists(vector_file):
-            QMessageBox.warning(self, "错误", "请选择有效的矢量文件")
             return
 
         if not output_dir:
@@ -390,23 +550,87 @@ class DataPreprocessingTab(QWidget):
         try:
             self._log(f"[拼接] 开始处理...")
             self._log(f"[拼接]   瓦片: {tiles_dir}")
-            self._log(f"[拼接]   矢量: {vector_file}")
             
-            self.compositor = TileCompositor(
+            # Use worker for stitching
+            self.stitch_worker = StitchWorker(
                 tiles_dir=tiles_dir,
-                vector_path=vector_file,
                 output_dir=output_dir,
                 zoom_level=self.stitch_zoom.value()
             )
+            self.stitch_worker.log.connect(self._log)
             
-            self.compositor.process_all()
-            self._log(f"[拼接] ✓ 完成！")
-            QMessageBox.information(self, "完成", f"瓦片拼接完成！\n输出目录: {output_dir}")
+            def on_ok(msg):
+                self._log(f"[拼接] ✓ {msg}")
+                QMessageBox.information(self, "完成", f"瓦片拼接完成！\n输出目录: {output_dir}")
+                
+            def on_fail(msg):
+                self._log(f"[拼接] ✗ 错误: {msg}")
+                QMessageBox.critical(self, "错误", msg)
+                
+            self.stitch_worker.finished.connect(on_ok)
+            self.stitch_worker.failed.connect(on_fail)
+            self.stitch_worker.start()
+
         except Exception as e:
             import traceback
             traceback.print_exc()
             self._log(f"[拼接] ✗ 错误: {e}")
             QMessageBox.critical(self, "错误", str(e))
+            
+    def _start_filtering(self) -> None:
+        """Start tile filtering."""
+        input_dir = self.filter_input.text().strip()
+        output_dir = self.filter_output.text().strip()
+        threshold = self.filter_threshold.value()
+
+        if not input_dir or not os.path.exists(input_dir):
+            QMessageBox.warning(self, "错误", "请选择有效的输入目录")
+            return
+
+        if not output_dir:
+            QMessageBox.warning(self, "错误", "请指定输出目录")
+            return
+
+        try:
+            self._log(f"[清洗] 开始过滤无效瓦片...")
+            self._log(f"[清洗]   输入: {input_dir}")
+            self._log(f"[清洗]   输出: {output_dir}")
+            self._log(f"[清洗]   黑边阈值: {threshold}")
+            
+            self.filter_worker = FilterWorker(input_dir, output_dir, threshold)
+            self.filter_worker.log.connect(self._log)
+            self.filter_worker.finished.connect(lambda msg: QMessageBox.information(self, "完成", msg))
+            self.filter_worker.failed.connect(lambda msg: QMessageBox.critical(self, "错误", msg))
+            
+            self.filter_worker.start()
+            
+        except Exception as e:
+            self._log(f"[清洗] ✗ 错误: {e}")
+            QMessageBox.critical(self, "错误", str(e))
+
+class FilterWorker(QThread):
+    finished = Signal(str)
+    failed = Signal(str)
+    log = Signal(str)
+
+    def __init__(self, input_dir, output_dir, threshold):
+        super().__init__()
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.threshold = threshold
+
+    def run(self):
+        try:
+            filter_tool = TileFilter(self.input_dir, self.output_dir, self.threshold)
+            
+            def callback(msg):
+                self.log.emit(f"[清洗] {msg}")
+                
+            total, copied, skipped = filter_tool.process(callback)
+            self.finished.emit(f"清洗完成！\n总计: {total}\n保留: {copied}\n剔除: {skipped}")
+        except Exception as e:
+            self.failed.emit(str(e))
+
 class DownloadWorker(QThread):
     finished = Signal(str)
     failed = Signal(str)
@@ -418,24 +642,40 @@ class DownloadWorker(QThread):
         self.bbox = bbox
         self.out_dir = out_dir
         self.zoom = zoom
+        self._is_running = True
+        self._downloader = None
+
+    def stop(self):
+        """Request stop."""
+        self._is_running = False
+        if self._downloader:
+            self._downloader.stop()
+        self.requestInterruption()
+        self.wait(2000) # Wait up to 2s
+        if self.isRunning():
+            self.terminate() # Force kill if stuck
 
     def run(self) -> None:
         try:
+            if not self._is_running: return
+            
             from config.download_types import DOWNLOAD_TYPES
             dt = DOWNLOAD_TYPES[self.dtype_key]
             if dt.dtype == "vector":
                 output = os.path.join(self.out_dir, "osm_features.geojson")
                 self.log.emit(f"[OSM] bbox={self.bbox}, output={output}")
-                res = fetch_osm_features(
-                    vector_path=None,
-                    bbox=f"{self.bbox[0]},{self.bbox[1]},{self.bbox[2]},{self.bbox[3]}",
-                    output_path=output,
-                    data_types=["road"],
-                )
-                if res is None:
-                    self.failed.emit("未下载到任何要素")
-                else:
-                    self.finished.emit(f"OSM下载完成，共{len(res)}条要素")
+                # OSM fetcher is synchronous, hard to interrupt gracefully without refactoring core
+                if self._is_running:
+                    res = fetch_osm_features(
+                        vector_path=None,
+                        bbox=f"{self.bbox[0]},{self.bbox[1]},{self.bbox[2]},{self.bbox[3]}",
+                        output_path=output,
+                        data_types=["road"],
+                    )
+                    if res is None:
+                        self.failed.emit("未下载到任何要素")
+                    else:
+                        self.finished.emit(f"OSM下载完成，共{len(res)}条要素")
             else:
                 valid_urls = detect_working_urls(dt.url_options)
                 if not valid_urls:
@@ -450,7 +690,7 @@ class DownloadWorker(QThread):
                 log_msg = f"Multiple URLs ({len(url_template)})" if isinstance(url_template, list) else url_template
                 self.log.emit(f"[Tiles] zoom={self.zoom} url={log_msg}")
                 
-                downloader = TileDownloader(
+                self._downloader = TileDownloader(
                     url_template=url_template,
                     output_base_dir=tiles_dir,
                     max_workers=dt.max_workers,
@@ -460,8 +700,67 @@ class DownloadWorker(QThread):
                     backoff_factor=dt.backoff_factor,
                     request_timeout=dt.request_timeout,
                 )
-                downloader.download_tiles_from_bbox(self.bbox, self.zoom)
-                self.finished.emit(f"瓦片下载完成，目录: {tiles_dir}")
+                
+                def callback(msg):
+                    self.log.emit(f"[Tiles] {msg}")
+                    
+                self._downloader.download_tiles_from_bbox(self.bbox, self.zoom, callback=callback)
+                
+                if self._is_running:
+                    self.finished.emit(f"瓦片下载完成，目录: {tiles_dir}")
+                else:
+                    self.log.emit("[Tiles] 下载已停止")
         except Exception as e:
-            logger.exception("Download worker failed")
+            if self._is_running:
+                logger.exception("Download worker failed")
+                self.failed.emit(str(e))
+
+class CleanWorker(QThread):
+    finished = Signal(object) # Returns trunk_roads
+    failed = Signal(str)
+    log = Signal(str)
+    
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+        self.cleaner = None
+        
+    def run(self):
+        try:
+            self.cleaner = OSMCleaner(self.file_path)
+            
+            def callback(msg):
+                self.log.emit(f"[清洗] {msg}")
+                
+            trunk_roads = self.cleaner.extract_trunk_roads(callback=callback)
+            self.finished.emit(trunk_roads)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+class StitchWorker(QThread):
+    finished = Signal(str)
+    failed = Signal(str)
+    log = Signal(str)
+    
+    def __init__(self, tiles_dir, output_dir, zoom_level):
+        super().__init__()
+        self.tiles_dir = tiles_dir
+        self.output_dir = output_dir
+        self.zoom_level = zoom_level
+        
+    def run(self):
+        try:
+            compositor = TileCompositor(
+                tiles_dir=self.tiles_dir,
+                vector_path=None,
+                output_dir=self.output_dir,
+                zoom_level=self.zoom_level
+            )
+            
+            def callback(msg):
+                self.log.emit(f"[拼接] {msg}")
+                
+            compositor.process_all(generate_vrt=False, callback=callback)
+            self.finished.emit("拼接完成")
+        except Exception as e:
             self.failed.emit(str(e))

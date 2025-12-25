@@ -255,24 +255,29 @@ class TileCompositor:
         """
         return f"{west:.6f}_{south:.6f}_{east:.6f}_{north:.6f}"
 
-    def composite_and_save(self, output_base_dir: Union[str, Path], tile_quadkeys: Optional[List[str]] = None) -> List[Tuple[Path, Path]]:
+    def composite_and_save(self, output_base_dir: Union[str, Path], tile_quadkeys: Optional[List[str]] = None, generate_vrt: bool = True, callback=None) -> List[Tuple[Path, Optional[Path]]]:
         """拼接瓦片并保存为大图。
         
         Args:
             output_base_dir: 输出基目录
             tile_quadkeys: 要处理的瓦片 quadkey 列表（如果为 None 则处理所有）
+            generate_vrt: 是否生成 VRT 文件
+            callback: 进度回调函数
             
         Returns:
-            (image_path, vrt_path) 元组列表
+            (image_path, vrt_path) 元组列表 (vrt_path 可能为 None)
         """
         output_base_dir = Path(output_base_dir)
         output_base_dir.mkdir(parents=True, exist_ok=True)
         
         # 创建子目录
         images_dir = output_base_dir / "images"
-        vrts_dir = output_base_dir / "vrts"
         images_dir.mkdir(exist_ok=True)
-        vrts_dir.mkdir(exist_ok=True)
+        
+        vrts_dir = None
+        if generate_vrt:
+            vrts_dir = output_base_dir / "vrts"
+            vrts_dir.mkdir(exist_ok=True)
         
         # 确定要处理的瓦片
         if tile_quadkeys is None:
@@ -280,12 +285,22 @@ class TileCompositor:
         
         if not tile_quadkeys:
             logger.warning("No tiles to process")
+            if callback:
+                callback("警告: 没有瓦片需要处理")
             return []
         
         results = []
         
-        logger.info(f"✓ 开始拼接瓦片")
-        logger.info(f"  加载的瓦片总数: {len(self.tiles_dict)}")
+        msg = f"✓ 开始拼接瓦片 (Generate VRT: {generate_vrt})"
+        logger.info(msg)
+        if callback:
+            callback(msg)
+            
+        msg = f"  加载的瓦片总数: {len(self.tiles_dict)}"
+        logger.info(msg)
+        if callback:
+            callback(msg)
+            
         logger.info(f"  缩放级别: {self.zoom}")
         logger.info(f"  复合图尺寸: {COMPOSITE_SIZE}x{COMPOSITE_SIZE} 像素 ({TILES_PER_SIDE}x{TILES_PER_SIDE} 瓦片)")
         
@@ -326,7 +341,10 @@ class TileCompositor:
                 
                 if composite_tiles:
                     composite_idx += 1
-                    logger.info(f"  [{composite_idx}] 正在拼接复合图 (x:[{x}, {composite_end_x}], y:[{y}, {composite_end_y}])...")
+                    msg = f"  [{composite_idx}] 正在拼接复合图 (x:[{x}, {composite_end_x}], y:[{y}, {composite_end_y}])..."
+                    logger.info(msg)
+                    if callback:
+                        callback(msg)
                     logger.info(f"       ├─ 加载 {len(composite_tiles)} 个瓦片")
                     
                     # 拼接
@@ -366,10 +384,12 @@ class TileCompositor:
                     cv2.imwrite(str(image_path), composite_img)
                     logger.info(f"       ├─ 已保存图像: {filename}.png ({composite_img.shape})")
                     
-                    # 保存 VRT 到 vrts 目录 (使用 Meters 坐标)
-                    vrt_path = vrts_dir / f"{filename}.vrt"
-                    self._create_vrt(image_path, vrt_path, (west_m, south_m, east_m, north_m))
-                    logger.info(f"       └─ 已保存 VRT: {filename}.vrt")
+                    vrt_path = None
+                    if generate_vrt:
+                        # 保存 VRT 到 vrts 目录 (使用 Meters 坐标)
+                        vrt_path = vrts_dir / f"{filename}.vrt"
+                        self._create_vrt(image_path, vrt_path, (west_m, south_m, east_m, north_m))
+                        logger.info(f"       └─ 已保存 VRT: {filename}.vrt")
                     
                     results.append((image_path, vrt_path))
                 
@@ -377,16 +397,19 @@ class TileCompositor:
             
             x = composite_end_x + 1
         
-        logger.info(f"✓ 瓦片拼接完成: 生成 {len(results)} 个复合图")
+        msg = f"✓ 瓦片拼接完成: 生成 {len(results)} 个复合图"
+        logger.info(msg)
+        if callback:
+            callback(msg)
         return results
 
-    def process_all(self, vector_path: Optional[Union[str, Path]] = None, output_dir: Optional[Union[str, Path]] = None) -> List[Tuple[Path, Path]]:
+    def process_all(self, vector_path: Optional[Union[str, Path]] = None, output_dir: Optional[Union[str, Path]] = None, generate_vrt: bool = True, callback=None) -> List[Tuple[Path, Optional[Path]]]:
         """一次性执行拼接与矢量切割，兼容 GUI 期望的调用方式。"""
         vp = Path(vector_path) if vector_path else self.vector_path
         out = Path(output_dir) if output_dir else self.output_dir
         if out is None:
             raise ValueError("output_dir is required")
-        results = self.composite_and_save(out)
+        results = self.composite_and_save(out, generate_vrt=generate_vrt, callback=callback)
         if results and vp is not None:
             try:
                 self.clip_vector_data(str(vp), out)
