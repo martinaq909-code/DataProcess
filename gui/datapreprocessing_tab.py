@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QGroupBox, QFileDialog,
     QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QMessageBox,
-    QRadioButton, QStackedWidget, QScrollArea
+    QRadioButton, QStackedWidget, QScrollArea, QCheckBox
 )
 
 # Import modules
@@ -317,6 +317,49 @@ class DataPreprocessingTab(QWidget):
         form_layout.addRow("黑边阈值 (默认1/16):", self.filter_threshold)
 
         layout.addLayout(form_layout)
+        
+        # Road filtering section (optional)
+        road_group_layout = QVBoxLayout()
+        road_group_layout.setSpacing(4)
+        
+        # Enable road filtering checkbox
+        self.enable_road_filter = QCheckBox("启用道路筛选")
+        self.enable_road_filter.setToolTip("勾选以启用基于道路矢量的筛选功能")
+        self.enable_road_filter.toggled.connect(self._toggle_road_filter)
+        road_group_layout.addWidget(self.enable_road_filter)
+        
+        # Road vector file
+        road_vector_layout = QHBoxLayout()
+        road_vector_layout.setContentsMargins(20, 0, 0, 0)  # Indent
+        self.filter_road_vector = QLineEdit()
+        self.filter_road_vector.setPlaceholderText("选择道路矢量文件 (GeoJSON, Shapefile...)")
+        self.filter_road_vector.setEnabled(False)
+        road_vector_btn = QPushButton("浏览")
+        road_vector_btn.setMaximumWidth(70)
+        road_vector_btn.clicked.connect(self._select_road_vector_for_filter)
+        road_vector_btn.setEnabled(False)
+        self.filter_road_vector_btn = road_vector_btn
+        road_vector_layout.addWidget(QLabel("矢量文件:"))
+        road_vector_layout.addWidget(self.filter_road_vector)
+        road_vector_layout.addWidget(road_vector_btn)
+        road_group_layout.addLayout(road_vector_layout)
+        
+        # Road threshold
+        road_threshold_layout = QHBoxLayout()
+        road_threshold_layout.setContentsMargins(20, 0, 0, 0)  # Indent
+        self.filter_road_threshold = QDoubleSpinBox()
+        self.filter_road_threshold.setRange(0.0, 10.0)
+        self.filter_road_threshold.setSingleStep(0.1)
+        self.filter_road_threshold.setValue(0.5)  # Default 50%
+        self.filter_road_threshold.setDecimals(2)
+        self.filter_road_threshold.setEnabled(False)
+        self.filter_road_threshold.setToolTip("道路长度/瓦片对角线 >= 阈值")
+        road_threshold_layout.addWidget(QLabel("道路占比阈值:"))
+        road_threshold_layout.addWidget(self.filter_road_threshold)
+        road_threshold_layout.addStretch()
+        road_group_layout.addLayout(road_threshold_layout)
+        
+        layout.addLayout(road_group_layout)
 
         # Filter button
         filter_btn = QPushButton("执行清洗 (复制有效瓦片)")
@@ -325,6 +368,21 @@ class DataPreprocessingTab(QWidget):
         layout.addWidget(filter_btn)
 
         return group
+    
+    def _toggle_road_filter(self, checked: bool) -> None:
+        """Toggle road filtering controls."""
+        self.filter_road_vector.setEnabled(checked)
+        self.filter_road_vector_btn.setEnabled(checked)
+        self.filter_road_threshold.setEnabled(checked)
+    
+    def _select_road_vector_for_filter(self) -> None:
+        """Select road vector file for filtering."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择道路矢量文件", "",
+            "Vector Files (*.geojson *.shp *.gpkg);;All Files (*)"
+        )
+        if path:
+            self.filter_road_vector.setText(path)
 
     def _select_bbox_vector(self) -> None:
         """Select vector file for BBox."""
@@ -582,6 +640,19 @@ class DataPreprocessingTab(QWidget):
         input_dir = self.filter_input.text().strip()
         output_dir = self.filter_output.text().strip()
         threshold = self.filter_threshold.value()
+        
+        # Road filtering parameters
+        enable_road = self.enable_road_filter.isChecked()
+        road_vector = None
+        road_threshold = 0.5
+        
+        if enable_road:
+            road_vector = self.filter_road_vector.text().strip()
+            road_threshold = self.filter_road_threshold.value()
+            
+            if not road_vector or not os.path.exists(road_vector):
+                QMessageBox.warning(self, "错误", "请选择有效的道路矢量文件")
+                return
 
         if not input_dir or not os.path.exists(input_dir):
             QMessageBox.warning(self, "错误", "请选择有效的输入目录")
@@ -596,8 +667,17 @@ class DataPreprocessingTab(QWidget):
             self._log(f"[清洗]   输入: {input_dir}")
             self._log(f"[清洗]   输出: {output_dir}")
             self._log(f"[清洗]   黑边阈值: {threshold}")
+            if enable_road:
+                self._log(f"[清洗]   道路筛选: 已启用")
+                self._log(f"[清洗]   矢量文件: {road_vector}")
+                self._log(f"[清洗]   道路阈值: {road_threshold}")
+            else:
+                self._log(f"[清洗]   道路筛选: 未启用")
             
-            self.filter_worker = FilterWorker(input_dir, output_dir, threshold)
+            self.filter_worker = FilterWorker(
+                input_dir, output_dir, threshold,
+                road_vector, road_threshold
+            )
             self.filter_worker.log.connect(self._log)
             self.filter_worker.finished.connect(lambda msg: QMessageBox.information(self, "完成", msg))
             self.filter_worker.failed.connect(lambda msg: QMessageBox.critical(self, "错误", msg))
@@ -613,15 +693,23 @@ class FilterWorker(QThread):
     failed = Signal(str)
     log = Signal(str)
 
-    def __init__(self, input_dir, output_dir, threshold):
+    def __init__(self, input_dir, output_dir, threshold, road_vector=None, road_threshold=0.5):
         super().__init__()
         self.input_dir = input_dir
         self.output_dir = output_dir
         self.threshold = threshold
+        self.road_vector = road_vector
+        self.road_threshold = road_threshold
 
     def run(self):
         try:
-            filter_tool = TileFilter(self.input_dir, self.output_dir, self.threshold)
+            filter_tool = TileFilter(
+                self.input_dir, 
+                self.output_dir, 
+                self.threshold,
+                road_vector_path=self.road_vector,
+                road_threshold=self.road_threshold
+            )
             
             def callback(msg):
                 self.log.emit(f"[清洗] {msg}")
