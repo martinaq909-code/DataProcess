@@ -4,6 +4,7 @@ import json
 import time
 import random
 import logging
+import threading
 from typing import Tuple, Optional, Union, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -48,7 +49,7 @@ def _load_checkpoint(path: str) -> dict:
             with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception:
-            logging.warning("无法加载 checkpoint，使用空进度。")
+            logger.warning("无法加载 checkpoint，使用空进度。")
             return {}
     return {}
 
@@ -66,6 +67,182 @@ def _tile_to_filename(tile: mercantile.Tile) -> str:
     return f"{mercantile.quadkey(tile)}.png"
 
 
+class AdaptiveRateLimiter:
+    """
+    自适应速率限制器 - 根据服务器响应动态调整下载速度
+    
+    核心策略:
+    1. 正常响应 -> 逐步提速（成功计数累积）
+    2. 检测到限速(403/429) -> 立即大幅降速
+    3. 连续成功一定数量后 -> 尝试恢复速度
+    """
+    
+    def __init__(
+        self,
+        min_sleep: float = 0.3,
+        max_sleep: float = 3.0,
+        initial_sleep: float = 0.8,
+        speedup_threshold: int = 50,    # 连续成功N次后提速
+        speedup_factor: float = 0.9,    # 提速时sleep乘以此系数
+        slowdown_factor: float = 2.5,   # 降速时sleep乘以此系数
+        min_workers: int = 1,
+        max_workers: int = 6,
+        initial_workers: int = 3,
+    ):
+        self.min_sleep = min_sleep
+        self.max_sleep = max_sleep
+        self.current_sleep = initial_sleep
+        self.speedup_threshold = speedup_threshold
+        self.speedup_factor = speedup_factor
+        self.slowdown_factor = slowdown_factor
+        
+        self.min_workers = min_workers
+        self.max_workers = max_workers
+        self.current_workers = initial_workers
+        
+        self.success_count = 0
+        self.total_success = 0
+        self.total_errors = 0
+        self.rate_limit_events = 0
+        
+        self._lock = threading.Lock()
+    
+    def record_success(self):
+        """记录成功请求，可能触发提速"""
+        with self._lock:
+            self.success_count += 1
+            self.total_success += 1
+            
+            # 连续成功达到阈值，尝试提速
+            if self.success_count >= self.speedup_threshold:
+                old_sleep = self.current_sleep
+                self.current_sleep = max(
+                    self.min_sleep,
+                    self.current_sleep * self.speedup_factor
+                )
+                # 也可以增加worker
+                if self.current_workers < self.max_workers and self.success_count >= self.speedup_threshold * 2:
+                    self.current_workers = min(self.max_workers, self.current_workers + 1)
+                    logger.info(f"[自适应] 提速: workers {self.current_workers-1} -> {self.current_workers}")
+                
+                if old_sleep != self.current_sleep:
+                    logger.info(f"[自适应] 提速: sleep {old_sleep:.2f}s -> {self.current_sleep:.2f}s")
+                
+                self.success_count = 0  # 重置计数
+    
+    def record_rate_limit(self):
+        """记录限速事件(403/429)，立即降速"""
+        with self._lock:
+            self.rate_limit_events += 1
+            self.total_errors += 1
+            self.success_count = 0  # 重置成功计数
+            
+            old_sleep = self.current_sleep
+            old_workers = self.current_workers
+            
+            # 大幅降速
+            self.current_sleep = min(
+                self.max_sleep,
+                self.current_sleep * self.slowdown_factor
+            )
+            # 减少worker
+            if self.current_workers > self.min_workers:
+                self.current_workers = max(self.min_workers, self.current_workers - 1)
+            
+            logger.warning(
+                f"[自适应] 检测到限速! 降速: sleep {old_sleep:.2f}s -> {self.current_sleep:.2f}s, "
+                f"workers {old_workers} -> {self.current_workers}"
+            )
+    
+    def record_error(self):
+        """记录其他错误"""
+        with self._lock:
+            self.total_errors += 1
+            # 轻微降速
+            self.current_sleep = min(
+                self.max_sleep,
+                self.current_sleep * 1.2
+            )
+    
+    def get_sleep_time(self) -> float:
+        """获取当前应该sleep的时间（带随机抖动）"""
+        with self._lock:
+            base = self.current_sleep
+        # 添加±30%的随机抖动，模拟人类行为
+        jitter = random.uniform(0.7, 1.3)
+        return base * jitter
+    
+    def get_current_workers(self) -> int:
+        """获取当前建议的worker数量"""
+        with self._lock:
+            return self.current_workers
+    
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        with self._lock:
+            return {
+                "current_sleep": self.current_sleep,
+                "current_workers": self.current_workers,
+                "total_success": self.total_success,
+                "total_errors": self.total_errors,
+                "rate_limit_events": self.rate_limit_events,
+            }
+
+
+class ServerRotator:
+    """
+    服务器轮询器 - 分散请求到多个服务器，避免单点压力
+    """
+    
+    def __init__(self, url_templates: List[str]):
+        if not url_templates:
+            raise ValueError("至少需要一个URL模板")
+        self.url_templates = url_templates
+        self._index = 0
+        self._lock = threading.Lock()
+        self._failure_counts = {url: 0 for url in url_templates}
+        self._cooldown_until = {url: 0.0 for url in url_templates}
+    
+    def get_next_url(self) -> str:
+        """获取下一个可用的URL（轮询 + 冷却检查）"""
+        with self._lock:
+            now = time.time()
+            attempts = 0
+            while attempts < len(self.url_templates):
+                url = self.url_templates[self._index]
+                self._index = (self._index + 1) % len(self.url_templates)
+                
+                # 检查是否在冷却期
+                if now >= self._cooldown_until[url]:
+                    return url
+                attempts += 1
+            
+            # 所有服务器都在冷却，返回冷却时间最短的
+            min_cooldown_url = min(self._cooldown_until, key=self._cooldown_until.get)
+            return min_cooldown_url
+    
+    def report_failure(self, url: str, is_rate_limit: bool = False):
+        """报告服务器失败，可能触发冷却"""
+        with self._lock:
+            self._failure_counts[url] = self._failure_counts.get(url, 0) + 1
+            
+            if is_rate_limit:
+                # 限速错误，冷却30-60秒
+                cooldown = random.uniform(30, 60)
+                self._cooldown_until[url] = time.time() + cooldown
+                logger.warning(f"[轮询] 服务器 {url[:50]}... 触发限速，冷却 {cooldown:.0f}s")
+    
+    def report_success(self, url: str):
+        """报告成功，重置失败计数"""
+        with self._lock:
+            self._failure_counts[url] = 0
+
+
+# 全局自适应限速器实例（在TileDownloader中初始化）
+_adaptive_limiter: Optional[AdaptiveRateLimiter] = None
+_server_rotator: Optional[ServerRotator] = None
+
+
 def _download_one(
     tile: mercantile.Tile,
     output_dir: str,
@@ -74,21 +251,24 @@ def _download_one(
     max_retries: int,
     backoff_factor: float,
     request_timeout: float,
+    adaptive_limiter: Optional[AdaptiveRateLimiter] = None,
+    server_rotator: Optional[ServerRotator] = None,
 ) -> Tuple[str, bool, str]:
-    """下载单个瓦片"""
+    """下载单个瓦片（支持自适应限速）"""
     filename = _tile_to_filename(tile)
     filepath = os.path.join(output_dir, filename)
     if os.path.exists(filepath):
         return filename, True, "exists"
 
-    if isinstance(url_template, list):
-        # Randomly shuffle URLs for load balancing and retry sequence
+    # 使用服务器轮询器或原始逻辑
+    if server_rotator:
+        urls = [server_rotator.get_next_url() for _ in range(min(3, max_retries))]
+    elif isinstance(url_template, list):
         urls = list(url_template)
         random.shuffle(urls)
     else:
         urls = [url_template]
 
-    # Iterate through all available URLs
     last_error = "unknown_error"
     for url_fmt in urls:
         url = url_fmt.format(x=tile.x, y=tile.y, z=tile.z)
@@ -96,61 +276,71 @@ def _download_one(
         attempt = 0
         while attempt <= max_retries:
             try:
-                # Randomize UA occasionally on retries (every 2nd retry) to avoid fingerprinting
+                # 定期更换UA
                 if attempt > 0 and attempt % 2 == 0:
                     session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
 
                 resp = session.get(url, stream=True, timeout=request_timeout)
+                
                 if resp.status_code == 200:
                     with open(filepath, 'wb') as f:
                         for chunk in resp.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
-                    return filename, True, "ok"
-                elif resp.status_code in (403, 429):
-                    wait = (backoff_factor ** attempt) + random.uniform(0.5, 2.0)
-                    logging.warning(
-                        f"Got {resp.status_code} for {url}. Backing off {wait:.1f}s (attempt {attempt}/{max_retries})"
-                    )
-                    time.sleep(wait)
-                    last_error = f"status_{resp.status_code}"
                     
-                    # If 403 Forbidden, sometimes it's IP ban or URL specific.
-                    # If we have other URLs, maybe we should break early and try next URL?
-                    # But let's stick to retry logic for now, unless max retries reached.
-                elif 500 <= resp.status_code < 600:
-                    wait = (backoff_factor ** attempt) + random.uniform(0.5, 2.0)
-                    logging.warning(
-                        f"Server error {resp.status_code} for {url}. Backing off {wait:.1f}s"
+                    # 记录成功
+                    if adaptive_limiter:
+                        adaptive_limiter.record_success()
+                    if server_rotator:
+                        server_rotator.report_success(url_fmt)
+                    
+                    return filename, True, "ok"
+                    
+                elif resp.status_code in (403, 429):
+                    # 限速检测 - 触发自适应降速
+                    if adaptive_limiter:
+                        adaptive_limiter.record_rate_limit()
+                    if server_rotator:
+                        server_rotator.report_failure(url_fmt, is_rate_limit=True)
+                    
+                    wait = (backoff_factor ** attempt) * 2 + random.uniform(2, 5)
+                    logger.warning(
+                        f"限速 {resp.status_code} for tile {tile.z}/{tile.x}/{tile.y}. "
+                        f"等待 {wait:.1f}s (尝试 {attempt}/{max_retries})"
                     )
                     time.sleep(wait)
-                    last_error = f"status_{resp.status_code}"
+                    last_error = f"rate_limit_{resp.status_code}"
+                    
+                elif 500 <= resp.status_code < 600:
+                    wait = (backoff_factor ** attempt) + random.uniform(1, 3)
+                    logger.warning(f"服务器错误 {resp.status_code}. 等待 {wait:.1f}s")
+                    time.sleep(wait)
+                    last_error = f"server_error_{resp.status_code}"
+                    if adaptive_limiter:
+                        adaptive_limiter.record_error()
+                        
                 else:
-                    logging.error(f"Unexpected status {resp.status_code} for {url}")
+                    logger.error(f"意外状态码 {resp.status_code} for {url}")
                     last_error = f"status_{resp.status_code}"
-                    # For 404 or other 4xx errors, might be better to try next URL immediately
                     if resp.status_code == 404:
-                         break # Break retry loop to try next URL
+                        break
                     
             except RequestException as e:
                 wait = (backoff_factor ** attempt) + random.uniform(0.5, 2.0)
-                logging.warning(
-                    f"RequestException for {url}: {e}. Backing off {wait:.1f}s (attempt {attempt}/{max_retries})"
-                )
+                logger.warning(f"请求异常: {e}. 等待 {wait:.1f}s")
                 time.sleep(wait)
-                last_error = f"error_{e}"
+                last_error = f"request_error"
+                if adaptive_limiter:
+                    adaptive_limiter.record_error()
+                    
             except Exception as e:
-                logging.exception(f"未知异常: {e}")
-                last_error = f"error_{e}"
-                break # Fatal error, try next URL or exit
+                logger.exception(f"未知异常: {e}")
+                last_error = f"unknown_error"
+                break
 
             attempt += 1
-        
-        # If we are here, it means we exhausted retries for THIS url or broke out.
-        # Continue to next URL in the list.
-        logging.info(f"Failed with {url}, trying next available URL...")
 
-    return filename, False, f"all_urls_failed: {last_error}"
+    return filename, False, f"failed: {last_error}"
 
 
 def _worker_download_with_rate(
@@ -163,11 +353,26 @@ def _worker_download_with_rate(
     min_sleep: float,
     max_sleep: float,
     request_timeout: float,
+    adaptive_limiter: Optional[AdaptiveRateLimiter] = None,
+    server_rotator: Optional[ServerRotator] = None,
 ):
-    """线程池工作函数，包含速率控制"""
+    """线程池工作函数，包含自适应速率控制"""
+    # 初始随机延迟，错开请求
     time.sleep(random.uniform(0, 0.5))
-    result = _download_one(tile, outdir, url_template, session, max_retries, backoff_factor, request_timeout)
-    time.sleep(random.uniform(min_sleep, max_sleep))
+    
+    result = _download_one(
+        tile, outdir, url_template, session, 
+        max_retries, backoff_factor, request_timeout,
+        adaptive_limiter, server_rotator
+    )
+    
+    # 使用自适应sleep时间
+    if adaptive_limiter:
+        sleep_time = adaptive_limiter.get_sleep_time()
+    else:
+        sleep_time = random.uniform(min_sleep, max_sleep)
+    
+    time.sleep(sleep_time)
     return result
 
 
@@ -200,7 +405,7 @@ def _prepare_bounds_from_vector(vector_path: str) -> Tuple[float, float, float, 
     # 获取原始CRS
     src_crs = gdf.crs
     if src_crs is None:
-        logging.warning("矢量文件没有CRS信息，假设为WGS84（EPSG:4326）")
+        logger.warning("矢量文件没有CRS信息，假设为WGS84（EPSG:4326）")
         src_crs = "EPSG:4326"
 
     # 如果不是WGS84，则转换
@@ -212,7 +417,7 @@ def _prepare_bounds_from_vector(vector_path: str) -> Tuple[float, float, float, 
 
 
 class TileDownloader:
-    """瓦片下载器，支持从shapefile或bbox下载图像瓦片"""
+    """瓦片下载器，支持从shapefile或bbox下载图像瓦片（带自适应限速）"""
 
     def __init__(
         self,
@@ -230,6 +435,7 @@ class TileDownloader:
         max_retries: int = 6,
         backoff_factor: float = 1.5,
         request_timeout: float = 10.0,
+        enable_adaptive: bool = True,  # 新增：启用自适应限速
     ):
         """
         初始化TileDownloader
@@ -246,6 +452,7 @@ class TileDownloader:
         - backoff_factor: 重试退避因子
         - request_timeout: 单个请求超时时间（秒）
         - proxies: requests proxies dict
+        - enable_adaptive: 是否启用自适应限速（推荐开启）
         """
         self.url_template = url_template
         self.output_base_dir = output_base_dir
@@ -260,46 +467,79 @@ class TileDownloader:
         self.backoff_factor = backoff_factor
         self.request_timeout = request_timeout
         self.proxies = proxies
+        self.enable_adaptive = enable_adaptive
 
         self.session = _make_session(user_agent=user_agent, proxies=proxies)
         self.checkpoint = _load_checkpoint(checkpoint_path)
+        
+        # 初始化自适应限速器和服务器轮询器
+        if enable_adaptive:
+            self.adaptive_limiter = AdaptiveRateLimiter(
+                min_sleep=per_thread_min_sleep,
+                max_sleep=per_thread_max_sleep * 2,
+                initial_sleep=(per_thread_min_sleep + per_thread_max_sleep) / 2,
+                min_workers=1,
+                max_workers=max_workers,
+                initial_workers=min(3, max_workers),  # 保守起步
+            )
+            
+            # 如果有多个URL，初始化轮询器
+            if isinstance(url_template, list) and len(url_template) > 1:
+                self.server_rotator = ServerRotator(url_template)
+                logger.info(f"[自适应] 已启用服务器轮询，{len(url_template)}个节点")
+            else:
+                self.server_rotator = None
+                
+            logger.info("[自适应] 已启用自适应限速策略")
+        else:
+            self.adaptive_limiter = None
+            self.server_rotator = None
 
     def _save_checkpoint(self):
         """保存检查点"""
         _save_checkpoint(self.checkpoint_path, self.checkpoint)
 
     def _download_tiles_impl(self, tiles: List[mercantile.Tile]):
-        """实现瓦片下载的核心逻辑"""
+        """实现瓦片下载的核心逻辑（支持自适应限速）"""
         if not tiles:
-            logging.error("No tiles to download.")
+            logger.error("No tiles to download.")
             return
 
         try:
-            logging.info(f"Total tiles to download: {len(tiles)}")
+            logger.info(f"总瓦片数: {len(tiles)}")
 
             os.makedirs(self.output_base_dir, exist_ok=True)
 
             already_done = set(self.checkpoint.get("done", []))
             pending_tiles = [t for t in tiles if _tile_to_filename(t) not in already_done]
 
-            logging.info(f"{len(pending_tiles)} tiles pending (after checkpoint filter).")
+            logger.info(f"待下载瓦片: {len(pending_tiles)} (已完成: {len(already_done)})")
 
             n = len(pending_tiles)
             if n == 0:
-                logging.info("No pending tiles to download.")
+                logger.info("所有瓦片已下载完成。")
                 return
 
             total_batches = math.ceil(n / self.batch_size)
-            logging.info(f"Splitting into {total_batches} batch(es) with batch_size={self.batch_size}")
+            logger.info(f"分为 {total_batches} 个批次，每批 {self.batch_size} 张")
+            
+            if self.enable_adaptive:
+                logger.info("[自适应] 模式已启用 - 速度将根据服务器响应自动调整")
 
             for batch_idx in range(total_batches):
                 s = batch_idx * self.batch_size
                 e = min((batch_idx + 1) * self.batch_size, n)
                 batch_tiles = pending_tiles[s:e]
-                logging.info(f"Starting batch {batch_idx + 1}/{total_batches}: tiles {s + 1}..{e}")
+                logger.info(f"开始批次 {batch_idx + 1}/{total_batches}: 瓦片 {s + 1}..{e}")
+
+                # 自适应模式下动态获取worker数量
+                if self.enable_adaptive and self.adaptive_limiter:
+                    current_workers = self.adaptive_limiter.get_current_workers()
+                else:
+                    current_workers = self.max_workers
 
                 failures = []
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                with ThreadPoolExecutor(max_workers=current_workers) as executor:
                     future_to_tile = {}
                     for tile in batch_tiles:
                         future = executor.submit(
@@ -313,6 +553,8 @@ class TileDownloader:
                             self.per_thread_min_sleep,
                             self.per_thread_max_sleep,
                             self.request_timeout,
+                            self.adaptive_limiter,
+                            self.server_rotator,
                         )
                         future_to_tile[future] = tile
 
@@ -331,29 +573,65 @@ class TileDownloader:
                             failures.append((_tile_to_filename(tile), str(exc)))
                         
                         completed += 1
+                        # 每10%进度输出一次
                         if completed % max(1, len(future_to_tile) // 10) == 0:
-                            logging.info(f"Progress: {completed}/{len(future_to_tile)}")
+                            if self.enable_adaptive and self.adaptive_limiter:
+                                stats = self.adaptive_limiter.get_stats()
+                                logger.info(
+                                    f"进度: {completed}/{len(future_to_tile)} | "
+                                    f"速度: {stats['current_sleep']:.2f}s/请求 | "
+                                    f"限速事件: {stats['rate_limit_events']}"
+                                )
+                            else:
+                                logger.info(f"进度: {completed}/{len(future_to_tile)}")
 
                 self._save_checkpoint()
-                logging.info(
-                    f"Batch {batch_idx + 1} finished. Success: {len(batch_tiles) - len(failures)}, Failures: {len(failures)}"
+                
+                success_count = len(batch_tiles) - len(failures)
+                logger.info(
+                    f"批次 {batch_idx + 1} 完成. 成功: {success_count}, 失败: {len(failures)}"
                 )
 
                 if failures:
                     fail_path = os.path.join(self.output_base_dir, f"failures_batch_{batch_idx+1}.json")
                     with open(fail_path, 'w', encoding='utf-8') as f:
                         json.dump(failures, f, ensure_ascii=False, indent=2)
-                    logging.warning(f"Saved batch failures to {fail_path}")
+                    logger.warning(f"失败记录已保存到 {fail_path}")
 
+                # 批次间暂停（自适应模式下可能延长）
                 if batch_idx < total_batches - 1:
-                    pause = random.uniform(self.batch_pause_min, self.batch_pause_max)
-                    logging.info(f"Pausing {pause:.1f}s before next batch...")
+                    if self.enable_adaptive and self.adaptive_limiter:
+                        stats = self.adaptive_limiter.get_stats()
+                        # 如果有限速事件，延长暂停时间
+                        if stats['rate_limit_events'] > 0:
+                            extra_pause = stats['rate_limit_events'] * 30
+                            pause = random.uniform(
+                                self.batch_pause_min + extra_pause,
+                                self.batch_pause_max + extra_pause
+                            )
+                            logger.info(f"[自适应] 检测到限速，延长暂停至 {pause:.0f}s")
+                        else:
+                            pause = random.uniform(self.batch_pause_min, self.batch_pause_max)
+                    else:
+                        pause = random.uniform(self.batch_pause_min, self.batch_pause_max)
+                    
+                    logger.info(f"批次间暂停 {pause:.0f}s...")
                     time.sleep(pause)
 
-            logging.info("All batches finished.")
+            # 最终统计
+            if self.enable_adaptive and self.adaptive_limiter:
+                final_stats = self.adaptive_limiter.get_stats()
+                logger.info(
+                    f"下载完成! 总计: 成功 {final_stats['total_success']}, "
+                    f"错误 {final_stats['total_errors']}, 限速事件 {final_stats['rate_limit_events']}"
+                )
+            else:
+                logger.info("所有批次下载完成。")
+            
             self._save_checkpoint()
+            
         except Exception as e:
-            logging.exception(f"Error in _download_tiles_impl: {e}")
+            logger.exception(f"下载出错: {e}")
 
     def download_tiles_from_bbox(self, bbox: Union[str, tuple, list], zoom: int):
         """从BBox下载瓦片"""

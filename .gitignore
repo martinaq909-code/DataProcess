@@ -66,3 +66,6 @@ test_stability_output/
 # 废弃功能
 deprecated_features/
 
+# issue
+issue/
+.github/

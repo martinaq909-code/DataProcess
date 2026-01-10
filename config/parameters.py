@@ -53,43 +53,60 @@ COMPOSITE_PRESETS = {
     "large": {"composite_size": 2048, "desc": "大 (2048×2048)"},
 }
 
-# 瓦片下载参数
+# 瓦片下载参数（自适应模式默认值）
 DOWNLOAD_CONFIG = {
-    "max_workers": 4,
-    "per_thread_min_sleep": 0.3,
-    "per_thread_max_sleep": 1.2,
-    "batch_size": 3000,
-    "batch_pause_min": 60.0,
-    "batch_pause_max": 180.0,
+    "max_workers": 4,              # 最大并发线程（自适应模式会动态调整）
+    "per_thread_min_sleep": 0.5,   # 请求间隔最小值
+    "per_thread_max_sleep": 1.5,   # 请求间隔最大值
+    "batch_size": 1000,            # 每批次瓦片数（比原3000更保守）
+    "batch_pause_min": 90.0,       # 批次间暂停最小值
+    "batch_pause_max": 180.0,      # 批次间暂停最大值
     "max_retries": 6,
     "backoff_factor": 1.5,
-    "request_timeout": 10.0,
+    "request_timeout": 15.0,
+    "enable_adaptive": True,       # 启用自适应限速（新增）
 }
 
 DOWNLOAD_PRESETS = {
     "conservative": {
         "max_workers": 2,
-        "per_thread_min_sleep": 1.0,
-        "per_thread_max_sleep": 2.0,
-        "batch_pause_min": 120.0,
-        "batch_pause_max": 240.0,
-        "desc": "保守 (最安全)"
+        "per_thread_min_sleep": 1.5,
+        "per_thread_max_sleep": 3.0,
+        "batch_size": 300,
+        "batch_pause_min": 180.0,
+        "batch_pause_max": 300.0,
+        "enable_adaptive": True,
+        "desc": "保守 (最安全，适合敏感服务器)"
     },
     "standard": {
         "max_workers": 4,
-        "per_thread_min_sleep": 0.3,
-        "per_thread_max_sleep": 1.2,
-        "batch_pause_min": 60.0,
+        "per_thread_min_sleep": 0.5,
+        "per_thread_max_sleep": 1.5,
+        "batch_size": 1000,
+        "batch_pause_min": 90.0,
         "batch_pause_max": 180.0,
-        "desc": "标准 (推荐)"
+        "enable_adaptive": True,
+        "desc": "标准 (推荐，自动平衡速度与安全)"
     },
     "aggressive": {
         "max_workers": 6,
+        "per_thread_min_sleep": 0.2,
+        "per_thread_max_sleep": 0.8,
+        "batch_size": 2000,
+        "batch_pause_min": 45.0,
+        "batch_pause_max": 90.0,
+        "enable_adaptive": True,
+        "desc": "快速 (较快，有封禁风险)"
+    },
+    "turbo": {
+        "max_workers": 8,
         "per_thread_min_sleep": 0.1,
-        "per_thread_max_sleep": 0.5,
+        "per_thread_max_sleep": 0.3,
+        "batch_size": 3000,
         "batch_pause_min": 30.0,
         "batch_pause_max": 60.0,
-        "desc": "激进 (最快)"
+        "enable_adaptive": False,  # 关闭自适应，全速下载
+        "desc": "极速 (最快，高封禁风险，仅限本地/私有服务器)"
     },
 }
 
