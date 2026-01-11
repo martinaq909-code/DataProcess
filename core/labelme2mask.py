@@ -6,16 +6,24 @@ import cv2
 import PIL.Image
 # import labelme.utils # Not strictly needed if we implement logic manually
 
-def json_to_mask(json_dir, output_dir, label_name='road'):
+def json_to_mask(json_dir, output_dir, label_name='road', callback=None):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     json_files = glob.glob(os.path.join(json_dir, '*.json'))
-    print(f"Found {len(json_files)} json files in {json_dir}")
+    total_files = len(json_files)
+    msg = f"Found {total_files} json files in {json_dir}"
+    print(msg)
+    if callback:
+        callback(msg)
 
-    for json_path in json_files:
+    for i, json_path in enumerate(json_files):
         filename = os.path.basename(json_path)
         filename_no_ext = os.path.splitext(filename)[0]
+        
+        # Report progress
+        if callback and i % 10 == 0:
+            callback(f"Processing {i+1}/{total_files}: {filename}")
         
         with open(json_path, 'r') as f:
             data = json.load(f)
@@ -25,7 +33,10 @@ def json_to_mask(json_dir, output_dir, label_name='road'):
         
         # If height/width not in JSON, try to read from imagePath (optional, usually they are in JSON)
         if img_h is None or img_w is None:
-            print(f"Warning: Image size not found in {json_path}, skipping.")
+            err_msg = f"Warning: Image size not found in {json_path}, skipping."
+            print(err_msg)
+            if callback:
+                callback(err_msg)
             continue
 
         # Create empty mask (0 = background)

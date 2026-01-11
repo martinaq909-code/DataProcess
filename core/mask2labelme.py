@@ -79,22 +79,33 @@ def merge_polygons(parent_poly, child_poly):
     
     return new_poly
 
-def mask_to_labelme(mask_dir, output_dir, img_dir, label_name='road'):
+def mask_to_labelme(mask_dir, output_dir, img_dir, label_name='road', callback=None):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     mask_files = glob.glob(os.path.join(mask_dir, '*.png'))
+    total_files = len(mask_files)
     
-    print(f"Found {len(mask_files)} masks in {mask_dir}")
+    msg = f"Found {total_files} masks in {mask_dir}"
+    print(msg)
+    if callback:
+        callback(msg)
 
-    for mask_path in mask_files:
+    for i, mask_path in enumerate(mask_files):
         basename = os.path.basename(mask_path)
         filename_no_ext = os.path.splitext(basename)[0]
         image_filename = filename_no_ext + ".jpg"
         
+        # Report progress
+        if callback and i % 10 == 0:
+            callback(f"Processing {i+1}/{total_files}: {basename}")
+        
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is None:
-            print(f"Error reading {mask_path}")
+            err_msg = f"Error reading {mask_path}"
+            print(err_msg)
+            if callback:
+                callback(f"Error: {err_msg}")
             continue
             
         h, w = mask.shape

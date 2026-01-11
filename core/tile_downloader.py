@@ -468,6 +468,9 @@ class TileDownloader:
         self.request_timeout = request_timeout
         self.proxies = proxies
         self.enable_adaptive = enable_adaptive
+        
+        self._stop_event = False
+        self._executor = None
 
         self.session = _make_session(user_agent=user_agent, proxies=proxies)
         self.checkpoint = _load_checkpoint(checkpoint_path)
@@ -495,53 +498,75 @@ class TileDownloader:
             self.adaptive_limiter = None
             self.server_rotator = None
 
+    def stop(self):
+        """Request stop."""
+        self._stop_event = True
+        if self._executor:
+            self._executor.shutdown(wait=False)
+
     def _save_checkpoint(self):
         """保存检查点"""
         _save_checkpoint(self.checkpoint_path, self.checkpoint)
 
-    def _download_tiles_impl(self, tiles: List[mercantile.Tile]):
-        """实现瓦片下载的核心逻辑（支持自适应限速）"""
+    def _download_tiles_impl(self, tiles: List[mercantile.Tile], callback=None):
+        """实现瓦片下载的核心逻辑"""
         if not tiles:
-            logger.error("No tiles to download.")
+            logging.error("No tiles to download.")
+            if callback:
+                callback("No tiles to download.")
             return
 
         try:
-            logger.info(f"总瓦片数: {len(tiles)}")
+            msg = f"Total tiles to download: {len(tiles)}"
+            logging.info(msg)
+            if callback:
+                callback(msg)
 
             os.makedirs(self.output_base_dir, exist_ok=True)
 
             already_done = set(self.checkpoint.get("done", []))
             pending_tiles = [t for t in tiles if _tile_to_filename(t) not in already_done]
 
-            logger.info(f"待下载瓦片: {len(pending_tiles)} (已完成: {len(already_done)})")
+            msg = f"{len(pending_tiles)} tiles pending (after checkpoint filter)."
+            logging.info(msg)
+            if callback:
+                callback(msg)
 
             n = len(pending_tiles)
             if n == 0:
-                logger.info("所有瓦片已下载完成。")
+                logging.info("No pending tiles to download.")
+                if callback:
+                    callback("No pending tiles to download.")
                 return
 
             total_batches = math.ceil(n / self.batch_size)
-            logger.info(f"分为 {total_batches} 个批次，每批 {self.batch_size} 张")
-            
-            if self.enable_adaptive:
-                logger.info("[自适应] 模式已启用 - 速度将根据服务器响应自动调整")
+            msg = f"Splitting into {total_batches} batch(es) with batch_size={self.batch_size}"
+            logging.info(msg)
+            if callback:
+                callback(msg)
 
             for batch_idx in range(total_batches):
+                if self._stop_event:
+                    msg = "Download stopped by user request."
+                    logging.info(msg)
+                    if callback:
+                        callback(msg)
+                    break
+                    
                 s = batch_idx * self.batch_size
                 e = min((batch_idx + 1) * self.batch_size, n)
                 batch_tiles = pending_tiles[s:e]
-                logger.info(f"开始批次 {batch_idx + 1}/{total_batches}: 瓦片 {s + 1}..{e}")
-
-                # 自适应模式下动态获取worker数量
-                if self.enable_adaptive and self.adaptive_limiter:
-                    current_workers = self.adaptive_limiter.get_current_workers()
-                else:
-                    current_workers = self.max_workers
+                msg = f"Starting batch {batch_idx + 1}/{total_batches}: tiles {s + 1}..{e}"
+                logging.info(msg)
+                if callback:
+                    callback(msg)
 
                 failures = []
-                with ThreadPoolExecutor(max_workers=current_workers) as executor:
+                self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
+                with self._executor as executor:
                     future_to_tile = {}
                     for tile in batch_tiles:
+                        if self._stop_event: break
                         future = executor.submit(
                             _worker_download_with_rate,
                             tile,
@@ -560,6 +585,10 @@ class TileDownloader:
 
                     completed = 0
                     for future in as_completed(future_to_tile):
+                        if self._stop_event: 
+                            logging.info("Download stopping...")
+                            break
+                            
                         tile = future_to_tile[future]
                         try:
                             filename, success, msg = future.result()
@@ -575,22 +604,16 @@ class TileDownloader:
                         completed += 1
                         # 每10%进度输出一次
                         if completed % max(1, len(future_to_tile) // 10) == 0:
-                            if self.enable_adaptive and self.adaptive_limiter:
-                                stats = self.adaptive_limiter.get_stats()
-                                logger.info(
-                                    f"进度: {completed}/{len(future_to_tile)} | "
-                                    f"速度: {stats['current_sleep']:.2f}s/请求 | "
-                                    f"限速事件: {stats['rate_limit_events']}"
-                                )
-                            else:
-                                logger.info(f"进度: {completed}/{len(future_to_tile)}")
+                            msg = f"Progress: {completed}/{len(future_to_tile)}"
+                            logging.info(msg)
+                            if callback:
+                                callback(msg)
 
                 self._save_checkpoint()
-                
-                success_count = len(batch_tiles) - len(failures)
-                logger.info(
-                    f"批次 {batch_idx + 1} 完成. 成功: {success_count}, 失败: {len(failures)}"
-                )
+                msg = f"Batch {batch_idx + 1} finished. Success: {len(batch_tiles) - len(failures)}, Failures: {len(failures)}"
+                logging.info(msg)
+                if callback:
+                    callback(msg)
 
                 if failures:
                     fail_path = os.path.join(self.output_base_dir, f"failures_batch_{batch_idx+1}.json")
@@ -598,24 +621,12 @@ class TileDownloader:
                         json.dump(failures, f, ensure_ascii=False, indent=2)
                     logger.warning(f"失败记录已保存到 {fail_path}")
 
-                # 批次间暂停（自适应模式下可能延长）
-                if batch_idx < total_batches - 1:
-                    if self.enable_adaptive and self.adaptive_limiter:
-                        stats = self.adaptive_limiter.get_stats()
-                        # 如果有限速事件，延长暂停时间
-                        if stats['rate_limit_events'] > 0:
-                            extra_pause = stats['rate_limit_events'] * 30
-                            pause = random.uniform(
-                                self.batch_pause_min + extra_pause,
-                                self.batch_pause_max + extra_pause
-                            )
-                            logger.info(f"[自适应] 检测到限速，延长暂停至 {pause:.0f}s")
-                        else:
-                            pause = random.uniform(self.batch_pause_min, self.batch_pause_max)
-                    else:
-                        pause = random.uniform(self.batch_pause_min, self.batch_pause_max)
-                    
-                    logger.info(f"批次间暂停 {pause:.0f}s...")
+                if batch_idx < total_batches - 1 and not self._stop_event:
+                    pause = random.uniform(self.batch_pause_min, self.batch_pause_max)
+                    msg = f"Pausing {pause:.1f}s before next batch..."
+                    logging.info(msg)
+                    if callback:
+                        callback(msg)
                     time.sleep(pause)
 
             # 最终统计
@@ -631,21 +642,24 @@ class TileDownloader:
             self._save_checkpoint()
             
         except Exception as e:
-            logger.exception(f"下载出错: {e}")
+            logging.exception(f"Error in _download_tiles_impl: {e}")
+            if callback:
+                callback(f"Error: {e}")
 
-    def download_tiles_from_bbox(self, bbox: Union[str, tuple, list], zoom: int):
+
+    def download_tiles_from_bbox(self, bbox: Union[str, tuple, list], zoom: int, callback=None):
         """从BBox下载瓦片"""
         west, south, east, north = _parse_bbox_input(bbox)
         tiles = list(mercantile.tiles(west, south, east, north, [zoom]))
-        self._download_tiles_impl(tiles)
+        self._download_tiles_impl(tiles, callback=callback)
 
-    def download_tiles_from_vector(self, vector_path: str, zoom: int):
+    def download_tiles_from_vector(self, vector_path: str, zoom: int, callback=None):
         """从矢量文件下载瓦片"""
         west, south, east, north = _prepare_bounds_from_vector(vector_path)
         tiles = list(mercantile.tiles(west, south, east, north, [zoom]))
-        self._download_tiles_impl(tiles)
+        self._download_tiles_impl(tiles, callback=callback)
 
-    def download_tiles(self, input_range: Union[str, tuple, list], zoom: int, is_vector: bool = False):
+    def download_tiles(self, input_range: Union[str, tuple, list], zoom: int, is_vector: bool = False, callback=None):
         """
         统一的下载入口
         
@@ -653,10 +667,11 @@ class TileDownloader:
         - input_range: 矢量文件路径或BBox (west,south,east,north)
         - zoom: 缩放级别
         - is_vector: 是否为矢量输入
+        - callback: 进度回调函数
         """
         if is_vector:
-            self.download_tiles_from_vector(input_range, zoom)
+            self.download_tiles_from_vector(input_range, zoom, callback=callback)
         else:
-            self.download_tiles_from_bbox(input_range, zoom)
+            self.download_tiles_from_bbox(input_range, zoom, callback=callback)
 
 
