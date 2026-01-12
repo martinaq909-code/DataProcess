@@ -5,6 +5,8 @@ import os
 import sys
 import logging
 import mercantile
+import time
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -37,6 +39,12 @@ class DataPreprocessingTab(QWidget):
         self.download_worker = None
         self.cleaner: Optional[OSMCleaner] = None
         self.compositor: Optional[TileCompositor] = None
+
+        self._download_start_ts: Optional[float] = None
+        self._download_total_tiles: Optional[int] = None
+        self._download_done_tiles: int = 0
+        self._re_total = re.compile(r"Total tiles to download:\s*(\d+)")
+        self._re_progress = re.compile(r"Progress:\s*(\d+)/(\d+)")
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -183,11 +191,37 @@ class DataPreprocessingTab(QWidget):
         out_form.addRow("输出目录:", out_layout)
         layout.addLayout(out_form)
 
-        # Download button
+        # Buttons
+        btn_layout = QHBoxLayout()
+
         self.download_btn = QPushButton("开始下载")
         self.download_btn.setMinimumHeight(32)
         self.download_btn.clicked.connect(self._start_download)
-        layout.addWidget(self.download_btn)
+        btn_layout.addWidget(self.download_btn)
+
+        self.download_pause_btn = QPushButton("暂停")
+        self.download_pause_btn.setMinimumHeight(32)
+        self.download_pause_btn.setEnabled(False)
+        self.download_pause_btn.clicked.connect(self._pause_download)
+        btn_layout.addWidget(self.download_pause_btn)
+
+        self.download_resume_btn = QPushButton("继续")
+        self.download_resume_btn.setMinimumHeight(32)
+        self.download_resume_btn.setEnabled(False)
+        self.download_resume_btn.clicked.connect(self._resume_download)
+        btn_layout.addWidget(self.download_resume_btn)
+
+        self.download_cancel_btn = QPushButton("取消")
+        self.download_cancel_btn.setMinimumHeight(32)
+        self.download_cancel_btn.setEnabled(False)
+        self.download_cancel_btn.clicked.connect(self._cancel_download)
+        btn_layout.addWidget(self.download_cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        self.download_status = QLabel("状态：空闲")
+        self.download_status.setWordWrap(True)
+        layout.addWidget(self.download_status)
 
         return group
 
@@ -466,6 +500,40 @@ class DataPreprocessingTab(QWidget):
         self.log_text.append(msg)
         self.log_text.ensureCursorVisible()
 
+        # Update download status (best-effort, based on log text)
+        if msg.startswith("[Tiles]"):
+            m_total = self._re_total.search(msg)
+            if m_total:
+                self._download_total_tiles = int(m_total.group(1))
+                self._download_done_tiles = 0
+                self._download_start_ts = time.time()
+                self.download_status.setText(f"状态：下载中 0/{self._download_total_tiles}")
+                return
+
+            m_prog = self._re_progress.search(msg)
+            if m_prog:
+                done = int(m_prog.group(1))
+                total = int(m_prog.group(2))
+                self._download_done_tiles = done
+                if self._download_total_tiles is None:
+                    self._download_total_tiles = total
+                if self._download_start_ts:
+                    elapsed = max(0.1, time.time() - self._download_start_ts)
+                    rate = done / elapsed
+                    remaining = max(0, total - done)
+                    eta = remaining / rate if rate > 0 else None
+                    if eta is None:
+                        eta_str = "未知"
+                    elif eta < 60:
+                        eta_str = f"{eta:.0f}s"
+                    elif eta < 3600:
+                        eta_str = f"{eta/60:.1f}min"
+                    else:
+                        eta_str = f"{eta/3600:.1f}h"
+                    self.download_status.setText(f"状态：下载中 {done}/{total} | 速度 {rate:.2f} tiles/s | ETA {eta_str}")
+                else:
+                    self.download_status.setText(f"状态：下载中 {done}/{total}")
+
     def _start_download(self) -> None:
         dtype_key = self.download_type_combo.currentData()
         from config.download_types import DOWNLOAD_TYPES
@@ -534,14 +602,49 @@ class DataPreprocessingTab(QWidget):
             self._log(f"[下载] ✓ {msg}")
             QMessageBox.information(self, "完成", msg)
             self.download_btn.setEnabled(True)
+            self.download_pause_btn.setEnabled(False)
+            self.download_resume_btn.setEnabled(False)
+            self.download_cancel_btn.setEnabled(False)
+            self.download_status.setText("状态：完成")
         def on_fail(msg):
             self._log(f"[下载] ✗ {msg}")
             QMessageBox.critical(self, "错误", msg)
             self.download_btn.setEnabled(True)
+            self.download_pause_btn.setEnabled(False)
+            self.download_resume_btn.setEnabled(False)
+            self.download_cancel_btn.setEnabled(False)
+            self.download_status.setText("状态：失败")
         self.download_worker.finished.connect(on_ok)
         self.download_worker.failed.connect(on_fail)
         self.download_btn.setEnabled(False)
+        self.download_pause_btn.setEnabled(True)
+        self.download_cancel_btn.setEnabled(True)
+        self.download_resume_btn.setEnabled(False)
+        self.download_status.setText("状态：下载中")
         self.download_worker.start()
+
+    def _pause_download(self) -> None:
+        if self.download_worker and self.download_worker.isRunning():
+            self.download_worker.pause()
+            self.download_status.setText("状态：已暂停")
+            self.download_pause_btn.setEnabled(False)
+            self.download_resume_btn.setEnabled(True)
+
+    def _resume_download(self) -> None:
+        if self.download_worker and self.download_worker.isRunning():
+            self.download_worker.resume()
+            self.download_status.setText("状态：下载中")
+            self.download_pause_btn.setEnabled(True)
+            self.download_resume_btn.setEnabled(False)
+
+    def _cancel_download(self) -> None:
+        if self.download_worker and self.download_worker.isRunning():
+            self.download_worker.stop()
+            self.download_status.setText("状态：已取消")
+        self.download_btn.setEnabled(True)
+        self.download_pause_btn.setEnabled(False)
+        self.download_resume_btn.setEnabled(False)
+        self.download_cancel_btn.setEnabled(False)
 
     def _extract_trunk_roads(self) -> None:
         """Extract trunk roads."""
@@ -742,6 +845,22 @@ class DownloadWorker(QThread):
         self.wait(2000) # Wait up to 2s
         if self.isRunning():
             self.terminate() # Force kill if stuck
+
+    def pause(self):
+        if self._downloader:
+            try:
+                self._downloader.pause()
+                self.log.emit("[Tiles] 已暂停（线程将阻塞，继续后恢复）")
+            except Exception:
+                pass
+
+    def resume(self):
+        if self._downloader:
+            try:
+                self._downloader.resume()
+                self.log.emit("[Tiles] 已继续")
+            except Exception:
+                pass
 
     def run(self) -> None:
         try:

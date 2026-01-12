@@ -28,6 +28,9 @@ import argparse
 import logging
 from pathlib import Path
 from datetime import datetime
+import json
+from uuid import uuid4
+from typing import Any, Dict, Optional
 
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -76,6 +79,30 @@ def setup_logging(output_dir, verbose=False):
     return log_file
 
 
+def _save_json_atomic(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _file_info(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if path is None:
+        return None
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {"path": str(p), "exists": False}
+        st = p.stat()
+        return {
+            "path": str(p.resolve()),
+            "exists": True,
+            "size_bytes": int(st.st_size),
+            "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(),
+        }
+    except Exception:
+        return {"path": str(path), "exists": False, "error": "stat_failed"}
+
+
 class DataProcessingPipeline:
     """数据处理流程管理器"""
     
@@ -111,12 +138,88 @@ class DataProcessingPipeline:
         
         self.bbox = None
         self.logger = logging.getLogger(self.__class__.__name__)
+
+        self.run_id = uuid4().hex
+        self.manifest_path = self.output_dir / "pipeline_manifest.json"
+        self._manifest = {
+            "type": "data_processing_pipeline",
+            "run_id": self.run_id,
+            "started_at": None,
+            "finished_at": None,
+            "inputs": {
+                "boundary_file": str(self.boundary_file.resolve()),
+            },
+            "config": {
+                "zoom": int(self.zoom),
+                "road_threshold": float(self.road_threshold),
+                "black_threshold": float(self.black_threshold),
+                "enable_road_filter": bool(self.enable_road_filter),
+            },
+            "bbox_wgs84": None,
+            "steps": {},
+            "artifacts": {
+                "tiles_dir": str(self.tiles_dir.resolve()),
+                "tiles_manifest": None,
+                "osm_raw": None,
+                "osm_cleaned": None,
+                "composited_dir": str(self.composited_dir.resolve()),
+                "filtered_dir": str(self.filtered_dir.resolve()),
+                "log_dir": str((self.output_dir / "logs").resolve()),
+            },
+            "metrics": {},
+            "status": "running",
+            "error": None,
+        }
+
+    def _manifest_update(self, **kwargs) -> None:
+        self._manifest.update(kwargs)
+        try:
+            _save_json_atomic(self.manifest_path, self._manifest)
+        except Exception:
+            self.logger.exception("写入 pipeline_manifest.json 失败")
+
+    def _step_start(self, name: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        steps = self._manifest.setdefault("steps", {})
+        step = steps.setdefault(name, {})
+        step.update({
+            "status": "running",
+            "started_at": datetime.now().isoformat(),
+            "finished_at": None,
+            "duration_seconds": None,
+            "metrics": step.get("metrics", {}),
+            "artifacts": step.get("artifacts", {}),
+            "error": None,
+        })
+        if extra:
+            step.update(extra)
+        self._manifest_update()
+
+    def _step_finish(self, name: str, status: str = "success", error: Optional[str] = None) -> None:
+        steps = self._manifest.setdefault("steps", {})
+        step = steps.setdefault(name, {})
+        finished_at = datetime.now()
+        step["finished_at"] = finished_at.isoformat()
+        try:
+            if step.get("started_at"):
+                started_at = datetime.fromisoformat(step["started_at"])
+                step["duration_seconds"] = float((finished_at - started_at).total_seconds())
+        except Exception:
+            step["duration_seconds"] = None
+        step["status"] = status
+        step["error"] = error
+        self._manifest_update()
     
     def step1_read_boundary(self):
         """步骤1: 读取矢量边界"""
         self.logger.info("="*80)
         self.logger.info("步骤 1/7: 读取矢量边界")
         self.logger.info("="*80)
+
+        self._step_start("read_boundary", {
+            "artifacts": {
+                "boundary_file": _file_info(self.boundary_file),
+            }
+        })
         
         if not self.boundary_file.exists():
             raise FileNotFoundError(f"边界文件不存在: {self.boundary_file}")
@@ -139,6 +242,15 @@ class DataProcessingPipeline:
         # 计算预计瓦片数
         tiles = list(mercantile.tiles(*self.bbox, [self.zoom]))
         self.logger.info(f"预计下载瓦片数: {len(tiles)}")
+
+        self._manifest["bbox_wgs84"] = [self.bbox[0], self.bbox[1], self.bbox[2], self.bbox[3]]
+        self._manifest.setdefault("metrics", {})["estimated_tiles"] = int(len(tiles))
+        self._manifest["steps"]["read_boundary"].setdefault("metrics", {})["features"] = int(len(gdf))
+        self._manifest["steps"]["read_boundary"].setdefault("metrics", {})["estimated_tiles"] = int(len(tiles))
+        self._manifest["steps"]["read_boundary"].setdefault("artifacts", {})["bbox"] = self._manifest["bbox_wgs84"]
+        self._manifest_update()
+
+        self._step_finish("read_boundary", status="success")
         
         return self.bbox
     
@@ -147,6 +259,15 @@ class DataProcessingPipeline:
         self.logger.info("="*80)
         self.logger.info("步骤 2/7: 下载卫星瓦片")
         self.logger.info("="*80)
+
+        self._step_start("download_tiles", {
+            "metrics": {
+                "zoom": int(self.zoom),
+            },
+            "artifacts": {
+                "tiles_dir": _file_info(self.tiles_dir),
+            }
+        })
         
         dt = DOWNLOAD_TYPES['google']
         
@@ -167,6 +288,15 @@ class DataProcessingPipeline:
         # 统计下载结果
         downloaded = len(list(self.tiles_dir.glob("*.png")))
         self.logger.info(f"✓ 下载完成，共 {downloaded} 个瓦片")
+
+        tiles_manifest = self.tiles_dir / "download_manifest.json"
+        self._manifest["artifacts"]["tiles_manifest"] = str(tiles_manifest.resolve()) if tiles_manifest.exists() else None
+        self._manifest.setdefault("metrics", {})["tiles_downloaded"] = int(downloaded)
+        self._manifest["steps"]["download_tiles"].setdefault("metrics", {})["tiles_downloaded"] = int(downloaded)
+        self._manifest["steps"]["download_tiles"].setdefault("artifacts", {})["tiles_manifest"] = _file_info(tiles_manifest)
+        self._manifest_update()
+
+        self._step_finish("download_tiles", status="success")
         
         return downloaded
     
@@ -175,6 +305,12 @@ class DataProcessingPipeline:
         self.logger.info("="*80)
         self.logger.info("步骤 3/7: 下载OSM道路数据")
         self.logger.info("="*80)
+
+        self._step_start("download_osm", {
+            "artifacts": {
+                "osm_raw": _file_info(self.osm_dir / "osm_roads.geojson"),
+            }
+        })
         
         osm_file = self.osm_dir / "osm_roads.geojson"
         
@@ -191,13 +327,29 @@ class DataProcessingPipeline:
             
             if result is not None and len(result) > 0:
                 self.logger.info(f"✓ 下载完成，共 {len(result)} 条道路要素")
+                self._manifest["artifacts"]["osm_raw"] = str(osm_file.resolve())
+                self._manifest.setdefault("metrics", {})["osm_features"] = int(len(result))
+                self._manifest["steps"]["download_osm"].setdefault("metrics", {})["osm_features"] = int(len(result))
+                self._manifest["steps"]["download_osm"].setdefault("artifacts", {})["osm_raw"] = _file_info(osm_file)
+                self._manifest_update()
+                self._step_finish("download_osm", status="success")
                 return osm_file
             else:
                 self.logger.warning("未获取到道路要素，跳过道路筛选功能")
+                self._manifest["artifacts"]["osm_raw"] = str(osm_file.resolve()) if osm_file.exists() else None
+                self._manifest.setdefault("metrics", {})["osm_features"] = 0
+                self._manifest["steps"]["download_osm"].setdefault("metrics", {})["osm_features"] = 0
+                self._manifest["steps"]["download_osm"].setdefault("artifacts", {})["osm_raw"] = _file_info(osm_file)
+                self._manifest_update()
+                self._step_finish("download_osm", status="success")
                 return None
         except Exception as e:
             self.logger.error(f"OSM下载失败: {e}")
             self.logger.warning("将跳过道路筛选功能")
+            self._manifest["artifacts"]["osm_raw"] = str(osm_file.resolve()) if osm_file.exists() else None
+            self._manifest["error"] = f"osm_download_failed: {e}"
+            self._manifest_update()
+            self._step_finish("download_osm", status="failed", error=str(e))
             return None
     
     def step4_clean_osm(self, osm_file):
@@ -205,9 +357,16 @@ class DataProcessingPipeline:
         self.logger.info("="*80)
         self.logger.info("步骤 4/7: 清洗OSM道路数据")
         self.logger.info("="*80)
+
+        self._step_start("clean_osm", {
+            "artifacts": {
+                "osm_raw": _file_info(osm_file) if osm_file else None,
+            }
+        })
         
         if osm_file is None or not osm_file.exists():
             self.logger.warning("OSM文件不存在，跳过")
+            self._step_finish("clean_osm", status="skipped", error="osm_missing")
             return None
         
         cleaned_file = self.osm_dir / "osm_trunk_roads.geojson"
@@ -220,6 +379,14 @@ class DataProcessingPipeline:
         cleaner.save(str(cleaned_file))
         
         self.logger.info(f"✓ 提取完成，保留 {len(trunk_roads)} 条主干道")
+
+        self._manifest["artifacts"]["osm_cleaned"] = str(cleaned_file.resolve()) if cleaned_file.exists() else None
+        self._manifest.setdefault("metrics", {})["osm_trunk_roads"] = int(len(trunk_roads))
+        self._manifest["steps"]["clean_osm"].setdefault("metrics", {})["osm_trunk_roads"] = int(len(trunk_roads))
+        self._manifest["steps"]["clean_osm"].setdefault("artifacts", {})["osm_cleaned"] = _file_info(cleaned_file)
+        self._manifest_update()
+
+        self._step_finish("clean_osm", status="success")
         
         return cleaned_file
     
@@ -228,6 +395,13 @@ class DataProcessingPipeline:
         self.logger.info("="*80)
         self.logger.info("步骤 5/7: 拼接瓦片")
         self.logger.info("="*80)
+
+        self._step_start("composite_tiles", {
+            "artifacts": {
+                "tiles_dir": _file_info(self.tiles_dir),
+                "composited_dir": _file_info(self.composited_dir),
+            }
+        })
         
         self.logger.info(f"瓦片目录: {self.tiles_dir}")
         self.logger.info(f"输出目录: {self.composited_dir}")
@@ -244,6 +418,12 @@ class DataProcessingPipeline:
         )
         
         self.logger.info(f"✓ 拼接完成，生成 {len(results)} 个复合图")
+
+        self._manifest.setdefault("metrics", {})["composited_images"] = int(len(results))
+        self._manifest["steps"]["composite_tiles"].setdefault("metrics", {})["composited_images"] = int(len(results))
+        self._manifest_update()
+
+        self._step_finish("composite_tiles", status="success")
         
         return len(results)
     
@@ -252,6 +432,15 @@ class DataProcessingPipeline:
         self.logger.info("="*80)
         self.logger.info("步骤 6/7: 黑边检测")
         self.logger.info("="*80)
+
+        self._step_start("filter_black", {
+            "metrics": {
+                "black_threshold": float(self.black_threshold),
+            },
+            "artifacts": {
+                "input_images_dir": _file_info(self.composited_dir / "images"),
+            }
+        })
         
         input_images = self.composited_dir / "images"
         temp_dir = self.output_dir / "temp_filtered_black"
@@ -274,6 +463,18 @@ class DataProcessingPipeline:
         self.logger.info(f"  总计: {total}")
         self.logger.info(f"  保留: {copied}")
         self.logger.info(f"  剔除: {skipped}")
+
+        self._manifest.setdefault("metrics", {})["black_filter_total"] = int(total)
+        self._manifest.setdefault("metrics", {})["black_filter_kept"] = int(copied)
+        self._manifest.setdefault("metrics", {})["black_filter_removed"] = int(skipped)
+        self._manifest["steps"]["filter_black"].setdefault("metrics", {}).update({
+            "total": int(total),
+            "kept": int(copied),
+            "removed": int(skipped),
+        })
+        self._manifest_update()
+
+        self._step_finish("filter_black", status="success")
         
         return temp_dir, total, copied, skipped
     
@@ -282,6 +483,18 @@ class DataProcessingPipeline:
         self.logger.info("="*80)
         self.logger.info("步骤 7/7: 道路筛选")
         self.logger.info("="*80)
+
+        self._step_start("filter_road", {
+            "metrics": {
+                "road_threshold": float(self.road_threshold),
+                "enable_road_filter": bool(self.enable_road_filter),
+            },
+            "artifacts": {
+                "input_dir": _file_info(Path(input_dir)),
+                "osm_cleaned": _file_info(cleaned_osm_file) if cleaned_osm_file else None,
+                "filtered_dir": _file_info(self.filtered_dir),
+            }
+        })
         
         if not self.enable_road_filter:
             self.logger.info("道路筛选未启用，直接使用黑边筛选结果")
@@ -289,6 +502,10 @@ class DataProcessingPipeline:
             import shutil
             for img in input_dir.glob("*.png"):
                 shutil.copy2(img, self.filtered_dir / img.name)
+            self._manifest.setdefault("metrics", {})["road_filter_enabled"] = False
+            self._manifest.setdefault("metrics", {})["final_kept"] = int(len(list(self.filtered_dir.glob("*.png"))))
+            self._manifest_update()
+            self._step_finish("filter_road", status="skipped", error="road_filter_disabled")
             return len(list(self.filtered_dir.glob("*.png"))), 0, 0
         
         if cleaned_osm_file is None or not cleaned_osm_file.exists():
@@ -297,6 +514,10 @@ class DataProcessingPipeline:
             import shutil
             for img in input_dir.glob("*.png"):
                 shutil.copy2(img, self.filtered_dir / img.name)
+            self._manifest.setdefault("metrics", {})["road_filter_enabled"] = False
+            self._manifest.setdefault("metrics", {})["final_kept"] = int(len(list(self.filtered_dir.glob("*.png"))))
+            self._manifest_update()
+            self._step_finish("filter_road", status="skipped", error="osm_missing")
             return len(list(self.filtered_dir.glob("*.png"))), 0, 0
         
         self.logger.info(f"矢量文件: {cleaned_osm_file}")
@@ -322,12 +543,24 @@ class DataProcessingPipeline:
         self.logger.info(f"  保留: {copied}")
         self.logger.info(f"  剔除: {skipped}")
         self.logger.info(f"  额外过滤（道路不足）: {additional_filtered}")
+
+        self._manifest.setdefault("metrics", {})["road_filter_enabled"] = True
+        self._manifest.setdefault("metrics", {})["road_filter_total"] = int(total)
+        self._manifest.setdefault("metrics", {})["road_filter_kept"] = int(copied)
+        self._manifest.setdefault("metrics", {})["road_filter_removed"] = int(skipped)
+        self._manifest.setdefault("metrics", {})["road_filter_additional_removed"] = int(additional_filtered)
+        self._manifest.setdefault("metrics", {})["final_kept"] = int(copied)
+        self._manifest_update()
+
+        self._step_finish("filter_road", status="success")
         
         return total, copied, additional_filtered
     
     def run(self):
         """运行完整流程"""
         start_time = datetime.now()
+        self._manifest["started_at"] = start_time.isoformat()
+        self._manifest_update()
         
         self.logger.info("="*80)
         self.logger.info("数据清洗流程开始")
@@ -371,6 +604,19 @@ class DataProcessingPipeline:
             # 总结
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
+
+            self._manifest["finished_at"] = end_time.isoformat()
+            self._manifest.setdefault("metrics", {})["duration_seconds"] = float(duration)
+            self._manifest["status"] = "success"
+            self._manifest["error"] = None
+
+            # 在成功结束时补充主要产物文件信息
+            self._manifest["artifacts"]["tiles_manifest"] = self._manifest["artifacts"].get("tiles_manifest")
+            self._manifest["artifacts"]["boundary_file"] = str(self.boundary_file.resolve())
+            self._manifest["artifacts"]["boundary_file_info"] = _file_info(self.boundary_file)
+            self._manifest["artifacts"]["osm_raw_info"] = _file_info(Path(self._manifest["artifacts"]["osm_raw"])) if self._manifest["artifacts"].get("osm_raw") else None
+            self._manifest["artifacts"]["osm_cleaned_info"] = _file_info(Path(self._manifest["artifacts"]["osm_cleaned"])) if self._manifest["artifacts"].get("osm_cleaned") else None
+            self._manifest_update()
             
             self.logger.info("="*80)
             self.logger.info("处理完成！")
@@ -390,6 +636,15 @@ class DataProcessingPipeline:
             
         except Exception as e:
             self.logger.error(f"处理失败: {e}", exc_info=True)
+            self._manifest["finished_at"] = datetime.now().isoformat()
+            self._manifest["status"] = "failed"
+            self._manifest["error"] = str(e)
+            # 标记当前未完成 step
+            for name, step in self._manifest.get("steps", {}).items():
+                if step.get("status") == "running":
+                    self._step_finish(name, status="failed", error=str(e))
+                    break
+            self._manifest_update()
             return False
 
 

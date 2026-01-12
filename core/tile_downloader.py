@@ -5,8 +5,10 @@ import time
 import random
 import logging
 import threading
-from typing import Tuple, Optional, Union, List
+from typing import Tuple, Optional, Union, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from uuid import uuid4
+from datetime import datetime, timezone
 
 import requests
 from requests.exceptions import RequestException
@@ -62,9 +64,78 @@ def _save_checkpoint(path: str, checkpoint: dict) -> None:
     os.replace(tmp, path)
 
 
+def _save_json_atomic(path: str, payload: dict) -> None:
+    """原子写 JSON 文件，避免中途崩溃导致文件损坏。"""
+    tmp = path + ".tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
 def _tile_to_filename(tile: mercantile.Tile) -> str:
     """将瓦片对象转换为文件名（使用quadkey）"""
     return f"{mercantile.quadkey(tile)}.png"
+
+
+def _sniff_image_type(data: bytes) -> str:
+    """根据文件头判断图片类型（尽量轻量，不引入额外依赖）。"""
+    if len(data) < 12:
+        return "unknown"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "webp"
+    return "unknown"
+
+
+def _is_valid_image_header(first_bytes: bytes) -> bool:
+    """判定是否像一张有效的图片（用于识别被 200 返回的HTML/验证码页等）。"""
+    return _sniff_image_type(first_bytes) != "unknown"
+
+
+def _is_file_valid_image(path: str, min_file_size_bytes: int = 1024) -> Tuple[bool, str]:
+    """检查磁盘文件是否为有效图片（大小 + 头部签名）。"""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return False, "missing"
+    except OSError:
+        return False, "stat_error"
+
+    if st.st_size < min_file_size_bytes:
+        return False, "too_small"
+
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+    except OSError:
+        return False, "read_error"
+
+    if not _is_valid_image_header(head):
+        return False, "invalid_header"
+    return True, "ok"
+
+
+def _sleep_with_pause(pause_event: Optional[threading.Event], seconds: float, check_interval: float = 0.2) -> None:
+    """支持暂停/继续的 sleep。pause_event 为 set 表示运行中；clear 表示暂停。"""
+    if seconds <= 0:
+        return
+    if pause_event is None:
+        time.sleep(seconds)
+        return
+
+    end = time.time() + seconds
+    while True:
+        # 若被暂停，这里会阻塞直到 resume
+        pause_event.wait()
+        remaining = end - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(check_interval, remaining))
 
 
 class AdaptiveRateLimiter:
@@ -251,14 +322,29 @@ def _download_one(
     max_retries: int,
     backoff_factor: float,
     request_timeout: float,
+    verify_existing: bool = True,
+    min_file_size_bytes: int = 1024,
+    pause_event: Optional[threading.Event] = None,
     adaptive_limiter: Optional[AdaptiveRateLimiter] = None,
     server_rotator: Optional[ServerRotator] = None,
 ) -> Tuple[str, bool, str]:
     """下载单个瓦片（支持自适应限速）"""
     filename = _tile_to_filename(tile)
     filepath = os.path.join(output_dir, filename)
+    redownloaded_existing = False
     if os.path.exists(filepath):
-        return filename, True, "exists"
+        if verify_existing:
+            ok, reason = _is_file_valid_image(filepath, min_file_size_bytes=min_file_size_bytes)
+            if ok:
+                return filename, True, "exists_ok"
+            try:
+                os.remove(filepath)
+                redownloaded_existing = True
+            except OSError:
+                # 无法删除就当作失败，避免误判为成功
+                return filename, False, f"failed:existing_invalid_{reason}"
+        else:
+            return filename, True, "exists"
 
     # 使用服务器轮询器或原始逻辑
     if server_rotator:
@@ -276,6 +362,8 @@ def _download_one(
         attempt = 0
         while attempt <= max_retries:
             try:
+                if pause_event is not None:
+                    pause_event.wait()
                 # 定期更换UA
                 if attempt > 0 and attempt % 2 == 0:
                     session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
@@ -283,10 +371,41 @@ def _download_one(
                 resp = session.get(url, stream=True, timeout=request_timeout)
                 
                 if resp.status_code == 200:
+                    # 先写入磁盘，同时截取头部用于图片有效性校验
+                    first_bytes = b""
+                    total_written = 0
                     with open(filepath, 'wb') as f:
                         for chunk in resp.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
+                            if not chunk:
+                                continue
+                            if total_written < 32:
+                                need = 32 - total_written
+                                first_bytes += chunk[:need]
+                            f.write(chunk)
+                            total_written += len(chunk)
+
+                    # 基础完整性校验：避免 200 返回 HTML/验证码页、空内容等
+                    if total_written < min_file_size_bytes:
+                        try:
+                            os.remove(filepath)
+                        except OSError:
+                            pass
+                        last_error = "content_too_small"
+                        if adaptive_limiter:
+                            adaptive_limiter.record_error()
+                        attempt += 1
+                        continue
+
+                    if not _is_valid_image_header(first_bytes):
+                        try:
+                            os.remove(filepath)
+                        except OSError:
+                            pass
+                        last_error = "invalid_image_header"
+                        if adaptive_limiter:
+                            adaptive_limiter.record_error()
+                        attempt += 1
+                        continue
                     
                     # 记录成功
                     if adaptive_limiter:
@@ -294,6 +413,8 @@ def _download_one(
                     if server_rotator:
                         server_rotator.report_success(url_fmt)
                     
+                    if redownloaded_existing:
+                        return filename, True, "ok_redownloaded"
                     return filename, True, "ok"
                     
                 elif resp.status_code in (403, 429):
@@ -308,13 +429,13 @@ def _download_one(
                         f"限速 {resp.status_code} for tile {tile.z}/{tile.x}/{tile.y}. "
                         f"等待 {wait:.1f}s (尝试 {attempt}/{max_retries})"
                     )
-                    time.sleep(wait)
+                    _sleep_with_pause(pause_event, wait)
                     last_error = f"rate_limit_{resp.status_code}"
                     
                 elif 500 <= resp.status_code < 600:
                     wait = (backoff_factor ** attempt) + random.uniform(1, 3)
                     logger.warning(f"服务器错误 {resp.status_code}. 等待 {wait:.1f}s")
-                    time.sleep(wait)
+                    _sleep_with_pause(pause_event, wait)
                     last_error = f"server_error_{resp.status_code}"
                     if adaptive_limiter:
                         adaptive_limiter.record_error()
@@ -328,7 +449,7 @@ def _download_one(
             except RequestException as e:
                 wait = (backoff_factor ** attempt) + random.uniform(0.5, 2.0)
                 logger.warning(f"请求异常: {e}. 等待 {wait:.1f}s")
-                time.sleep(wait)
+                _sleep_with_pause(pause_event, wait)
                 last_error = f"request_error"
                 if adaptive_limiter:
                     adaptive_limiter.record_error()
@@ -340,7 +461,7 @@ def _download_one(
 
             attempt += 1
 
-    return filename, False, f"failed: {last_error}"
+    return filename, False, f"failed:{last_error}"
 
 
 def _worker_download_with_rate(
@@ -353,17 +474,27 @@ def _worker_download_with_rate(
     min_sleep: float,
     max_sleep: float,
     request_timeout: float,
+    verify_existing: bool,
+    min_file_size_bytes: int,
+    pause_event: Optional[threading.Event],
     adaptive_limiter: Optional[AdaptiveRateLimiter] = None,
     server_rotator: Optional[ServerRotator] = None,
 ):
     """线程池工作函数，包含自适应速率控制"""
     # 初始随机延迟，错开请求
-    time.sleep(random.uniform(0, 0.5))
+    _sleep_with_pause(pause_event, random.uniform(0, 0.5))
+
+    if pause_event is not None:
+        pause_event.wait()
     
     result = _download_one(
         tile, outdir, url_template, session, 
         max_retries, backoff_factor, request_timeout,
-        adaptive_limiter, server_rotator
+        verify_existing=verify_existing,
+        min_file_size_bytes=min_file_size_bytes,
+        pause_event=pause_event,
+        adaptive_limiter=adaptive_limiter,
+        server_rotator=server_rotator,
     )
     
     # 使用自适应sleep时间
@@ -372,7 +503,7 @@ def _worker_download_with_rate(
     else:
         sleep_time = random.uniform(min_sleep, max_sleep)
     
-    time.sleep(sleep_time)
+    _sleep_with_pause(pause_event, sleep_time)
     return result
 
 
@@ -436,6 +567,8 @@ class TileDownloader:
         backoff_factor: float = 1.5,
         request_timeout: float = 10.0,
         enable_adaptive: bool = True,  # 新增：启用自适应限速
+        verify_existing: bool = True,
+        min_file_size_bytes: int = 1024,
     ):
         """
         初始化TileDownloader
@@ -468,9 +601,29 @@ class TileDownloader:
         self.request_timeout = request_timeout
         self.proxies = proxies
         self.enable_adaptive = enable_adaptive
-        
+        self.verify_existing = verify_existing
+        self.min_file_size_bytes = min_file_size_bytes
+
+        self.run_id = uuid4().hex
+        self._run_started_at = None
+        self._run_finished_at = None
+        self._job_meta: Dict[str, object] = {}
+
+        self._stats_lock = threading.Lock()
+        self.stats: Dict[str, object] = {
+            "downloaded_ok": 0,
+            "skipped_existing": 0,
+            "re_downloaded_existing": 0,
+            "failures": 0,
+            "failure_reasons": {},
+        }
+
         self._stop_event = False
         self._executor = None
+
+        # set: 运行中；clear: 暂停
+        self._pause_event = threading.Event()
+        self._pause_event.set()
 
         self.session = _make_session(user_agent=user_agent, proxies=proxies)
         self.checkpoint = _load_checkpoint(checkpoint_path)
@@ -498,11 +651,60 @@ class TileDownloader:
             self.adaptive_limiter = None
             self.server_rotator = None
 
+    def _write_manifest(self) -> None:
+        """写入本次下载任务的元信息与统计，便于复现与排查。"""
+        try:
+            os.makedirs(self.output_base_dir, exist_ok=True)
+            manifest_path = os.path.join(self.output_base_dir, "download_manifest.json")
+
+            limiter_stats = None
+            if self.enable_adaptive and self.adaptive_limiter:
+                limiter_stats = self.adaptive_limiter.get_stats()
+
+            payload = {
+                "type": "tile_download",
+                "run_id": self.run_id,
+                "started_at_utc": self._run_started_at.isoformat() if self._run_started_at else None,
+                "finished_at_utc": self._run_finished_at.isoformat() if self._run_finished_at else None,
+                "output_dir": os.path.abspath(self.output_base_dir),
+                "checkpoint_path": os.path.abspath(self.checkpoint_path),
+                "url_template": self.url_template,
+                "download_config": {
+                    "max_workers": self.max_workers,
+                    "max_retries": self.max_retries,
+                    "backoff_factor": self.backoff_factor,
+                    "request_timeout": self.request_timeout,
+                    "batch_size": self.batch_size,
+                    "batch_pause_min": self.batch_pause_min,
+                    "batch_pause_max": self.batch_pause_max,
+                    "verify_existing": self.verify_existing,
+                    "min_file_size_bytes": self.min_file_size_bytes,
+                    "enable_adaptive": self.enable_adaptive,
+                },
+                "job": self._job_meta,
+                "stats": self.stats,
+                "adaptive_limiter": limiter_stats,
+            }
+
+            _save_json_atomic(manifest_path, payload)
+        except Exception:
+            logger.exception("写入 download_manifest.json 失败")
+
     def stop(self):
         """Request stop."""
         self._stop_event = True
+        # 避免暂停状态下无法退出
+        self._pause_event.set()
         if self._executor:
             self._executor.shutdown(wait=False)
+
+    def pause(self):
+        """Pause download (threads will block until resumed)."""
+        self._pause_event.clear()
+
+    def resume(self):
+        """Resume download."""
+        self._pause_event.set()
 
     def _save_checkpoint(self):
         """保存检查点"""
@@ -517,6 +719,7 @@ class TileDownloader:
             return
 
         try:
+            self._run_started_at = datetime.now(timezone.utc)
             msg = f"Total tiles to download: {len(tiles)}"
             logging.info(msg)
             if callback:
@@ -526,6 +729,14 @@ class TileDownloader:
 
             already_done = set(self.checkpoint.get("done", []))
             pending_tiles = [t for t in tiles if _tile_to_filename(t) not in already_done]
+
+            # 记录本次任务关键统计（写入 manifest）
+            try:
+                self._job_meta["total_tiles"] = int(len(tiles))
+                self._job_meta["pending_tiles"] = int(len(pending_tiles))
+                self._job_meta["checkpoint_done"] = int(len(already_done))
+            except Exception:
+                pass
 
             msg = f"{len(pending_tiles)} tiles pending (after checkpoint filter)."
             logging.info(msg)
@@ -540,6 +751,11 @@ class TileDownloader:
                 return
 
             total_batches = math.ceil(n / self.batch_size)
+            try:
+                self._job_meta["total_batches"] = int(total_batches)
+                self._job_meta["batch_size"] = int(self.batch_size)
+            except Exception:
+                pass
             msg = f"Splitting into {total_batches} batch(es) with batch_size={self.batch_size}"
             logging.info(msg)
             if callback:
@@ -562,7 +778,14 @@ class TileDownloader:
                     callback(msg)
 
                 failures = []
-                self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
+                effective_workers = self.max_workers
+                if self.enable_adaptive and self.adaptive_limiter:
+                    try:
+                        effective_workers = min(self.max_workers, int(self.adaptive_limiter.get_current_workers()))
+                    except Exception:
+                        effective_workers = self.max_workers
+
+                self._executor = ThreadPoolExecutor(max_workers=effective_workers)
                 with self._executor as executor:
                     future_to_tile = {}
                     for tile in batch_tiles:
@@ -578,6 +801,9 @@ class TileDownloader:
                             self.per_thread_min_sleep,
                             self.per_thread_max_sleep,
                             self.request_timeout,
+                            self.verify_existing,
+                            self.min_file_size_bytes,
+                            self._pause_event,
                             self.adaptive_limiter,
                             self.server_rotator,
                         )
@@ -596,10 +822,32 @@ class TileDownloader:
                                 done_list = self.checkpoint.setdefault("done", [])
                                 if filename not in done_list:
                                     done_list.append(filename)
+                                with self._stats_lock:
+                                    if msg in ("exists_ok", "exists"):
+                                        self.stats["skipped_existing"] = int(self.stats["skipped_existing"]) + 1
+                                    elif msg == "ok_redownloaded":
+                                        self.stats["downloaded_ok"] = int(self.stats["downloaded_ok"]) + 1
+                                        self.stats["re_downloaded_existing"] = int(self.stats["re_downloaded_existing"]) + 1
+                                    else:
+                                        self.stats["downloaded_ok"] = int(self.stats["downloaded_ok"]) + 1
                             else:
                                 failures.append((_tile_to_filename(tile), msg))
+                                with self._stats_lock:
+                                    self.stats["failures"] = int(self.stats["failures"]) + 1
+                                    reasons = self.stats.setdefault("failure_reasons", {})
+                                    raw = str(msg)
+                                    if raw.startswith("failed:"):
+                                        reason_key = raw[len("failed:"):]
+                                    else:
+                                        reason_key = raw
+                                    reasons[reason_key] = int(reasons.get(reason_key, 0)) + 1
                         except Exception as exc:
                             failures.append((_tile_to_filename(tile), str(exc)))
+                            with self._stats_lock:
+                                self.stats["failures"] = int(self.stats["failures"]) + 1
+                                reasons = self.stats.setdefault("failure_reasons", {})
+                                reason_key = "exception"
+                                reasons[reason_key] = int(reasons.get(reason_key, 0)) + 1
                         
                         completed += 1
                         # 每10%进度输出一次
@@ -645,17 +893,32 @@ class TileDownloader:
             logging.exception(f"Error in _download_tiles_impl: {e}")
             if callback:
                 callback(f"Error: {e}")
+        finally:
+            self._run_finished_at = datetime.now(timezone.utc)
+            self._write_manifest()
+
 
 
     def download_tiles_from_bbox(self, bbox: Union[str, tuple, list], zoom: int, callback=None):
         """从BBox下载瓦片"""
         west, south, east, north = _parse_bbox_input(bbox)
+        self._job_meta = {
+            "input_type": "bbox",
+            "bbox": [west, south, east, north],
+            "zoom": int(zoom),
+        }
         tiles = list(mercantile.tiles(west, south, east, north, [zoom]))
         self._download_tiles_impl(tiles, callback=callback)
 
     def download_tiles_from_vector(self, vector_path: str, zoom: int, callback=None):
         """从矢量文件下载瓦片"""
         west, south, east, north = _prepare_bounds_from_vector(vector_path)
+        self._job_meta = {
+            "input_type": "vector",
+            "vector_path": os.path.abspath(vector_path),
+            "bbox": [west, south, east, north],
+            "zoom": int(zoom),
+        }
         tiles = list(mercantile.tiles(west, south, east, north, [zoom]))
         self._download_tiles_impl(tiles, callback=callback)
 
